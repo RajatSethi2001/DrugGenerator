@@ -24,13 +24,13 @@ class HealthDataset(Dataset):
         return gene_data, health_data
 
 class HealthModel(nn.Module):
-    def __init__(self, num_genes, hidden_neurons=64):
+    def __init__(self, num_genes, hidden_neurons=32):
         super().__init__()
         self.input_layer = nn.Linear(num_genes, hidden_neurons)
         self.fc1 = nn.Linear(hidden_neurons, hidden_neurons)
-        self.bn1 = nn.BatchNorm1d(hidden_neurons)
+        self.bn1 = nn.LayerNorm(hidden_neurons)
         self.fc2 = nn.Linear(hidden_neurons, hidden_neurons)
-        self.bn2 = nn.BatchNorm1d(hidden_neurons)
+        self.bn2 = nn.LayerNorm(hidden_neurons)
         self.output_layer = nn.Linear(hidden_neurons, 1)
     
         self.activation = nn.ReLU()
@@ -114,7 +114,7 @@ def main():
     test_dataloader = DataLoader(test_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
 
     model = HealthModel(len(genes))
-    optimizer = optim.AdamW(model.parameters(), lr=1e-5, weight_decay=1e-6)
+    optimizer = optim.AdamW(model.parameters(), lr=1e-5, weight_decay=1e-4)
     if os.path.exists(savefile):
         checkpoint = torch.load(savefile, weights_only=True)
         model.load_state_dict(checkpoint["model_state_dict"])

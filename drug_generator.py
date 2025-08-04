@@ -21,7 +21,6 @@ from selfies_autoencoder import SelfiesEncoder, SelfiesDecoder
 from stable_baselines3 import PPO, TD3, A2C
 from stable_baselines3.common.callbacks import CheckpointCallback
 from stable_baselines3.common.noise import NormalActionNoise
-from train_condition_model import ConditionModelLinear, ConditionModel
 from train_health_model import HealthModel, HealthModelLinear
 from train_gctx import GenePertModel
 from utils import smiles_to_embedding, embedding_to_smiles, get_minmax, get_zscores, get_zscore_minmax
@@ -361,7 +360,7 @@ def rapid_toxicity_screen(smiles):
     return min(risk_score, 1.0)
 
 class DrugGenEnv(gym.Env):
-    def __init__(self, gctx_savefile, autoencoder_savefile, condition_savefile, condition_dirs, max_selfies_len=50):
+    def __init__(self, gctx_savefile, autoencoder_savefile, health_savefile, condition_dirs, max_selfies_len=50):
         super().__init__()
         with open("Data/selfies_alphabet.txt", "r") as f:
             self.selfies_alphabet = f.read().splitlines()
@@ -387,11 +386,10 @@ class DrugGenEnv(gym.Env):
         self.decoder.load_state_dict(ae_checkpoint["decoder_model"])
         self.decoder.eval()
 
-        condition_checkpoint = torch.load(condition_savefile)
-        conditions = condition_checkpoint["conditions"]
-        self.condition_model = ConditionModel(len(self.genes), len(conditions), 256)
-        self.condition_model.load_state_dict(condition_checkpoint["model_state_dict"])
-        self.condition_model.eval()
+        health_checkpoint = torch.load(health_savefile)
+        self.health_model = HealthModel(len(self.genes), 32)
+        self.health_model.load_state_dict(health_checkpoint["model_state_dict"])
+        self.health_model.eval()
 
         self.max_selfies_len = max_selfies_len
         self.reward_list = []
@@ -415,7 +413,7 @@ class DrugGenEnv(gym.Env):
         
         self.observation_space = spaces.Box(low=0, high=1, shape=(len(self.genes),), dtype=np.float32)
         self.action_space = spaces.Box(low=0, high=1, shape=(1202,), dtype=np.float32)
-        self.max_reward = 0
+        self.max_rewards = {filename: 0 for filename in self.condition_expr.keys()}
 
     def step(self, action: np.ndarray):
         selfies_embedding = action[:(len(action) - 2)]
@@ -438,16 +436,16 @@ class DrugGenEnv(gym.Env):
             
             new_expr = self.gctx_model(current_obs_expr_tensor, selfies_embedding_tensor, dosage_conc_tensor, dosage_time_tensor)
 
-        original_health = (1 - np.mean(self.condition_model(current_obs_expr_tensor)[0].detach().cpu().numpy()))
-        new_health = (1 - np.mean(self.condition_model(new_expr)[0].detach().cpu().numpy()))
+        original_health = self.health_model(current_obs_expr_tensor)[0].item()
+        new_health = self.health_model(new_expr)[0].item()
 
         healthiness = new_health - original_health
         unnorm_dosage_conc = (np.e ** dosage_conc) - 1
         unnorm_dosage_time = (np.e ** dosage_time) - 1
-        reward = max(0, healthiness) * sigmoid(10 * (qed_score - 0.4)) * sigmoid(10 * (0.5 - sa_score / 10)) * sigmoid(10 * (0.4 - risk_score))
+        reward = max(0, healthiness) * sigmoid(10 * (qed_score - 0.5)) * sigmoid(10 * (0.5 - sa_score / 10)) * sigmoid(10 * (0.4 - risk_score))
         self.reward_list.append(reward)
 
-        if reward > self.max_reward:
+        if reward > self.max_rewards[self.current_obs_file]:
             print(f"File: {self.current_obs_file}")
             print(f"SMILES: {smiles}")
             print(f"Dosage Concentration: {unnorm_dosage_conc} uM")
@@ -457,7 +455,7 @@ class DrugGenEnv(gym.Env):
             print(f"Drug SA Score: {sa_score}")
             print(f"Drug Risk Score: {risk_score}")
             print(f"Reward: {reward}")
-            self.max_reward = reward
+            self.max_rewards[self.current_obs_file] = reward
 
         return new_expr.detach().cpu().numpy(), reward, True, False, {}
 
@@ -481,12 +479,12 @@ class DrugGenEnv(gym.Env):
 def main():    
     gctx_savefile = "Models/gctx.pth"
     ae_savefile = "Models/selfies_autoencoder.pth"
-    condition_savefile = "Models/condition_model.pth"
+    health_savefile = "Models/health_model.pth"
 
-    condition_dirs = ["Conditions/Crohns_Disease"]
+    condition_dirs = ["Conditions/Unhealthy"]
     policy_savefile = "Models/drug_generator"
 
-    env = DrugGenEnv(gctx_savefile, ae_savefile, condition_savefile, condition_dirs)
+    env = DrugGenEnv(gctx_savefile, ae_savefile, health_savefile, condition_dirs)
     policy_kwargs = dict(
         net_arch=[1200, 1200],
         activation_fn=torch.nn.GELU
