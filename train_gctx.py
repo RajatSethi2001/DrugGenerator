@@ -7,6 +7,7 @@ import selfies as sf
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from scipy.stats import pearsonr
 from selfies_autoencoder import SelfiesEncoder, SelfiesDecoder
 from torch.utils.data import Dataset, DataLoader, Subset
 from utils import get_zscore_minmax, get_zscores, clean_dose_unit, smiles_to_embedding, set_seeds
@@ -36,202 +37,28 @@ from utils import get_zscore_minmax, get_zscores, clean_dose_unit, smiles_to_emb
 /0/META/ROW/pr_is_bing
 /0/META/ROW/pr_is_lm
 """
-def diagnose_training_issues(model, train_loader, test_loader, criterion, device='cpu'):
-    """Diagnose what's happening during training"""
-    
-    print("=== TRAINING DIAGNOSIS ===")
-    
-    model.eval()
-    
-    # Collect predictions and targets
-    all_predictions = []
-    all_targets = []
-    all_controls = []
-    all_diffs = []  # |target - control|
-    
-    with torch.no_grad():
-        for batch_idx, (ctl_expr, trt_expr, smiles_embedding, dose, time) in enumerate(train_loader):
-            if batch_idx >= 5:  # Only analyze first 5 batches
-                break
-                
-            ctl_expr = ctl_expr.to(device)
-            trt_expr = trt_expr.to(device)
-            smiles_embedding = smiles_embedding.to(device)
-            dose = dose.to(device)
-            time = time.to(device)
-            
-            predictions = model(ctl_expr, smiles_embedding, dose, time)
-            
-            all_predictions.append(predictions.cpu())
-            all_targets.append(trt_expr.cpu())
-            all_controls.append(ctl_expr.cpu())
-            
-            # Calculate control-treatment differences
-            diff = torch.abs(trt_expr - ctl_expr).cpu()
-            all_diffs.append(diff)
-    
-    predictions = torch.cat(all_predictions, dim=0)
-    targets = torch.cat(all_targets, dim=0)
-    controls = torch.cat(all_controls, dim=0)
-    diffs = torch.cat(all_diffs, dim=0)
-    
-    print(f"Analyzed {predictions.shape[0]} samples")
-    
-    # 1. Check if model is just predicting control values
-    control_mse = torch.mean((predictions - controls) ** 2).item()
-    target_mse = torch.mean((predictions - targets) ** 2).item()
-    
-    print(f"\n--- Prediction Analysis ---")
-    print(f"MSE(prediction, control): {control_mse:.6f}")
-    print(f"MSE(prediction, target): {target_mse:.6f}")
-    
-    if control_mse < 0.001:
-        print("WARNING: Model is mostly predicting control values!")
-        print("This suggests the model isn't learning compound effects.")
-    
-    # 2. Check prediction diversity
-    pred_std = torch.std(predictions, dim=0).mean().item()
-    target_std = torch.std(targets, dim=0).mean().item()
-    control_std = torch.std(controls, dim=0).mean().item()
-    
-    print(f"\n--- Diversity Analysis ---")
-    print(f"Prediction std (avg across genes): {pred_std:.6f}")
-    print(f"Target std (avg across genes): {target_std:.6f}")
-    print(f"Control std (avg across genes): {control_std:.6f}")
-    
-    if pred_std < 0.01:
-        print("WARNING: Predictions have very low diversity!")
-        print("Model might be predicting nearly constant values.")
-    
-    # 3. Check actual treatment effects in data
-    avg_effect_size = torch.mean(diffs).item()
-    max_effect_size = torch.max(diffs).item()
-    
-    print(f"\n--- Treatment Effect Analysis ---")
-    print(f"Average |treatment - control|: {avg_effect_size:.6f}")
-    print(f"Maximum |treatment - control|: {max_effect_size:.6f}")
-    
-    if avg_effect_size < 0.02:
-        print("WARNING: Treatment effects are very small!")
-        print("This might indicate weak compound effects or data issues.")
-    
-    # 4. Check for single control issue
-    unique_controls = torch.unique(controls, dim=0).shape[0]
-    total_samples = controls.shape[0]
-    
-    print(f"\n--- Control Diversity ---")
-    print(f"Unique control profiles: {unique_controls}")
-    print(f"Total samples: {total_samples}")
-    print(f"Control reuse ratio: {total_samples / unique_controls:.1f}")
-    
-    if unique_controls < 20:
-        print("WARNING: Very few unique control profiles!")
-        print("This limits the model's ability to learn.")
-    
-    # 5. Sample some predictions vs targets
-    print(f"\n--- Sample Predictions vs Targets (first 3 samples, first 5 genes) ---")
-    for i in range(min(3, predictions.shape[0])):
-        print(f"Sample {i}:")
-        print(f"  Control:    {controls[i, :5].numpy()}")
-        print(f"  Target:     {targets[i, :5].numpy()}")
-        print(f"  Prediction: {predictions[i, :5].numpy()}")
-        print(f"  |Tgt-Ctl|:  {diffs[i, :5].numpy()}")
-        print()
+class PearsonCorrLoss(nn.Module):
+    def __init__(self, eps=1e-8):
+        super(PearsonCorrLoss, self).__init__()
+        self.eps = eps
 
-def check_gradient_flow(model, train_loader, criterion, device='cpu'):
-    """Check if gradients are flowing properly"""
-    
-    print("=== GRADIENT FLOW CHECK ===")
-    
-    model.train()
-    
-    # Take one batch
-    ctl_expr, trt_expr, smiles_embedding, dose, time = next(iter(train_loader))
-    ctl_expr = ctl_expr.to(device)
-    trt_expr = trt_expr.to(device)
-    smiles_embedding = smiles_embedding.to(device)
-    dose = dose.to(device)
-    time = time.to(device)
-    
-    # Forward pass
-    predictions = model(ctl_expr, smiles_embedding, dose, time)
-    loss = criterion(predictions, trt_expr)
-    
-    # Backward pass
-    model.zero_grad()
-    loss.backward()
-    
-    # Check gradients
-    total_grad_norm = 0
-    param_count = 0
-    zero_grad_count = 0
-    
-    print("Gradient norms by layer:")
-    for name, param in model.named_parameters():
-        if param.grad is not None:
-            grad_norm = param.grad.data.norm(2).item()
-            total_grad_norm += grad_norm ** 2
-            param_count += 1
-            
-            if grad_norm < 1e-8:
-                zero_grad_count += 1
-                
-            print(f"  {name}: {grad_norm:.8f}")
-        else:
-            print(f"  {name}: NO GRADIENT")
-    
-    total_grad_norm = total_grad_norm ** 0.5
-    
-    print(f"\nGradient Summary:")
-    print(f"  Total gradient norm: {total_grad_norm:.8f}")
-    print(f"  Parameters with gradients: {param_count}")
-    print(f"  Parameters with near-zero gradients: {zero_grad_count}")
-    
-    if total_grad_norm < 1e-6:
-        print("WARNING: Very small gradients detected!")
-        print("This suggests vanishing gradients or that the model isn't learning.")
-    
-    if zero_grad_count > param_count * 0.8:
-        print("WARNING: Most parameters have near-zero gradients!")
+    def forward(self, pred, target):
+        # pred and target shape: (batch_size, num_genes)
+        pred_mean = torch.mean(pred, dim=1, keepdim=True)
+        target_mean = torch.mean(target, dim=1, keepdim=True)
 
-def simple_baseline_test(train_loader, test_loader, device='cpu'):
-    """Test if a simple baseline can achieve similar performance"""
-    
-    print("=== SIMPLE BASELINE TEST ===")
-    
-    # Baseline 1: Always predict control
-    baseline1_train_loss = 0
-    baseline1_test_loss = 0
-    train_samples = 0
-    test_samples = 0
-    
-    criterion = nn.MSELoss()
-    
-    # Test on training data
-    for ctl_expr, trt_expr, _, _, _ in train_loader:
-        loss = criterion(ctl_expr.to(device), trt_expr.to(device))
-        baseline1_train_loss += loss.item()
-        train_samples += 1
-    
-    # Test on test data  
-    for ctl_expr, trt_expr, _, _, _ in test_loader:
-        loss = criterion(ctl_expr.to(device), trt_expr.to(device))
-        baseline1_test_loss += loss.item()
-        test_samples += 1
-    
-    baseline1_train_loss /= train_samples
-    baseline1_test_loss /= test_samples
-    
-    print(f"Baseline 1 (predict control):")
-    print(f"  Train loss: {baseline1_train_loss:.6f}")
-    print(f"  Test loss: {baseline1_test_loss:.6f}")
-    
-    # If your model's loss is similar to this baseline, it's not learning
-    print(f"\nIf your model's loss is close to {baseline1_train_loss:.6f},")
-    print(f"then it's essentially just predicting the control values.")
+        pred_centered = pred - pred_mean
+        target_centered = target - target_mean
+
+        numerator = torch.sum(pred_centered * target_centered, dim=1)
+        denominator = torch.sqrt(torch.sum(pred_centered**2, dim=1) * 
+                                 torch.sum(target_centered**2, dim=1) + self.eps)
+
+        r = numerator / denominator
+        return 1 - r.mean()
 
 class GenePertDataset(Dataset):
-    def __init__(self, gctx_file, compound_file, data_limit=30000, max_selfies_len=50):
+    def __init__(self, gctx_file, compound_file, data_limit=40000, max_selfies_len=50):
         self.gctx_fp = h5py.File(gctx_file, "r")
         
         data_idx = random.sample(range(0, len(self.gctx_fp["0/META/COL/id"])), data_limit)
@@ -298,20 +125,17 @@ class GenePertDataset(Dataset):
             else:
                 print(f"Condition {condition} has no valid mappings")
         
-        enc_hidden_size = 1200
-        enc_dropout_prob = 0.0
+        enc_hidden_size = 400
         enc_layers = 3
         enc_activation = nn.GELU
 
-        dec_hidden_size = 1200
-        dec_dropout_prob = 0.0
+        dec_hidden_size = 400
         dec_layers = 3
         dec_activation = nn.GELU
 
         self.encoder = SelfiesEncoder(len(self.selfies_alphabet),
                             max_selfies_len=max_selfies_len,
                             hidden_size=enc_hidden_size,
-                            dropout_prob=enc_dropout_prob,
                             num_layers=enc_layers,
                             activation_fn=enc_activation)
     
@@ -319,7 +143,6 @@ class GenePertDataset(Dataset):
                                 max_selfies_len=max_selfies_len,
                                 embedding_size=dec_hidden_size,
                                 hidden_size=dec_hidden_size,
-                                dropout_prob=dec_dropout_prob,
                                 num_layers=dec_layers,
                                 activation_fn=dec_activation)
         ae_checkpoint = torch.load("Models/selfies_autoencoder.pth")
@@ -332,9 +155,6 @@ class GenePertDataset(Dataset):
         data_map_items = list(valid_conditions.items())
         random.shuffle(data_map_items)
         for condition_id, gene_data in data_map_items:
-            if len(self.gctx_data) > 5000:
-                break
-
             ctl_exprs = []
             for ctl_idx in gene_data["ctl_idx"]:
                 ctl_expr_total = np.array(self.gctx_fp["0/DATA/0/matrix"][ctl_idx, :])
@@ -390,7 +210,7 @@ class GenePertDataset(Dataset):
         return self.important_genes
 
 class GenePertModel(nn.Module):
-    def __init__(self, num_genes, embedding_len, hidden_size=2000, dropout_prob=0.4, activation_fn=nn.GELU):
+    def __init__(self, num_genes, embedding_len, hidden_size=384, dropout_prob=0.3, activation_fn=nn.GELU):
         super().__init__()
         self.input_size = num_genes + embedding_len + 2
         self.input_layer = nn.Linear(self.input_size, hidden_size)
@@ -406,7 +226,7 @@ class GenePertModel(nn.Module):
         
         self.output_layer = nn.Linear(hidden_size, num_genes)
 
-        self.activation = nn.GELU()
+        self.activation = activation_fn()
         self.sigmoid = nn.Sigmoid()
         self.dropout = nn.Dropout(dropout_prob)
 
@@ -422,7 +242,6 @@ class GenePertModel(nn.Module):
     def forward(self, ctl_expr, smiles_embedding, dose, time):
         x = torch.cat((ctl_expr, smiles_embedding, dose, time), dim=-1)
         x = self.input_layer(x)
-        
         residual = x
         x = self.dropout(self.activation(self.bn1(self.fc1(x))))
         x = x + residual
@@ -431,17 +250,15 @@ class GenePertModel(nn.Module):
         x = self.dropout(self.activation(self.bn2(self.fc2(x))))
         x = x + residual
 
-        residual = x
         x = self.dropout(self.activation(self.bn3(self.fc3(x))))
-        x = x + residual
 
-        output = self.sigmoid(self.output_layer(x))
+        output = nn.Tanh()(self.output_layer(x))
         return output
 
 def main():
     set_seeds(1111)
 
-    train_test_split = 0.1
+    train_test_split = 0.2
     dataset = GenePertDataset("Data/annotated_GSE92742_Broad_LINCS_Level5_COMPZ_n473647x12328.gctx", "Data/compoundinfo_beta.txt")
     model_savefile = "Models/gctx.pth"
 
@@ -458,15 +275,19 @@ def main():
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
 
-    criterion = nn.MSELoss()
-    model = GenePertModel(len(dataset.get_gene_symbols()), 1200, 1200, dropout_prob=0.5)
-    optimizer = optim.AdamW(model.parameters(), lr=5e-4, weight_decay=1e-2, betas=(0.9, 0.999))
+    criterion = nn.SmoothL1Loss()
+    pearson_loss = PearsonCorrLoss()
+    pearson_loss_weight = 0.01
+    training_noise = 0.02
+
+    model = GenePertModel(len(dataset.get_gene_symbols()), 400, 400, dropout_prob=0.2, activation_fn=nn.GELU)
+    optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-3, betas=(0.9, 0.999))
 
     if os.path.exists(model_savefile):
         checkpoint = torch.load(model_savefile, weights_only=False)
         model.load_state_dict(checkpoint["model_state_dict"])
 
-    epochs = 400
+    epochs = 500
 
     for epoch in range(epochs):
         print(f"Training Epoch {epoch}")
@@ -475,8 +296,16 @@ def main():
         batch = 0
         for ctl_expr, trt_expr, smiles_embedding, dose, time in train_loader:
             optimizer.zero_grad()
-            output = model(ctl_expr, smiles_embedding, dose, time)
-            loss = criterion(output, trt_expr)
+            noisy_ctl_expr = ctl_expr + training_noise * torch.randn_like(ctl_expr)  # small Gaussian noise
+            noisy_smiles_embedding = smiles_embedding + training_noise * torch.randn_like(smiles_embedding)
+            pred_delta_expr = model(noisy_ctl_expr, noisy_smiles_embedding, dose, time)
+            pred_expr = ctl_expr + pred_delta_expr
+
+            pred_var = pred_expr.var(dim=1).mean()
+            trt_var  = trt_expr.var(dim=1).mean()
+
+            loss = criterion(pred_expr, trt_expr)
+            loss = loss + 0.01 * torch.abs(pred_var - trt_var)
             loss.backward()
             optimizer.step()
 
@@ -497,21 +326,31 @@ def main():
         test_loss = 0
         batch = 0
         for ctl_expr, trt_expr, smiles_embedding, dose, time in test_loader:
-            output = model(ctl_expr, smiles_embedding, dose, time)
-            loss = criterion(output, trt_expr)
+            pred_delta_expr = model(ctl_expr, smiles_embedding, dose, time)
+            pred_expr = ctl_expr + pred_delta_expr
+            loss = criterion(pred_expr, trt_expr)
             test_loss += loss.item()
 
             batch += 1
 
+            pred_std = pred_expr.std(dim=1).mean().item()
+            tgt_std  = trt_expr.std(dim=1).mean().item()
+            print("pred_std:", pred_std, "tgt_std:", tgt_std)
+            
+            r_list = []
+            for i in range(pred_expr.shape[0]):
+                r_list.append(pearsonr(pred_expr[i].detach().numpy(), trt_expr[i].detach().numpy())[0])
+            print(np.percentile(r_list,[5,25,50,75,95]), np.mean(r_list))
+
+            per_gene_r = [pearsonr(pred_expr[:,g].detach().numpy(), trt_expr[:,g].detach().numpy())[0] for g in range(400)]
+            print(np.percentile(per_gene_r,[5,25,50,75,95]), np.mean(per_gene_r))
+
+            # input()
+
             # print(f"Test Batch {batch}: Loss = {loss.item()}")
 
         test_loss /= batch   
-        print(f"Testing Loss = {test_loss}")
-
-        # diagnose_training_issues(model, train_loader, test_loader, criterion)
-        # check_gradient_flow(model, train_loader, criterion)
-        # simple_baseline_test(train_loader, test_loader)
-
+        print(f"Testing Loss = {test_loss}, Pearson-R = {pearsonr(pred_expr.detach().numpy()[0], trt_expr.detach().numpy()[0])[0]}")
 
 if __name__=="__main__":
     main()

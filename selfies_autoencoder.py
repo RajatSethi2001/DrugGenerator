@@ -12,10 +12,9 @@ from torch.utils.data import Dataset, DataLoader, Subset
 from utils import one_hot_encode, one_hot_decode, set_seeds
 
 class SelfiesEncoder(nn.Module):
-    def __init__(self, selfies_alphabet_len, max_selfies_len=50, hidden_size=1500, dropout_prob=0.4, num_layers=2, activation_fn=nn.ReLU):
+    def __init__(self, selfies_alphabet_len, max_selfies_len=50, hidden_size=1500, num_layers=2, activation_fn=nn.ReLU):
         super().__init__()
         self.input_size = selfies_alphabet_len * max_selfies_len
-        self.dropout_prob = dropout_prob
         self.input_layer = nn.Linear(self.input_size, hidden_size)
 
         self.fc_layers = []
@@ -23,7 +22,6 @@ class SelfiesEncoder(nn.Module):
             self.fc_layers.append(nn.Linear(hidden_size, hidden_size))
             self.fc_layers.append(nn.LayerNorm(hidden_size))
             self.fc_layers.append(activation_fn())
-            self.fc_layers.append(nn.Dropout(dropout_prob))
         
         self.output_layer = nn.Linear(hidden_size, hidden_size)
         self.sigmoid = nn.Sigmoid()
@@ -37,7 +35,7 @@ class SelfiesEncoder(nn.Module):
         return output
     
 class SelfiesDecoder(nn.Module):
-    def __init__(self, selfies_alphabet_len, max_selfies_len=50, embedding_size=1500, hidden_size=1500, dropout_prob=0.4, num_layers=2, activation_fn=nn.ReLU):
+    def __init__(self, selfies_alphabet_len, max_selfies_len=50, embedding_size=1500, hidden_size=1500, num_layers=2, activation_fn=nn.ReLU):
         super().__init__()
         self.selfies_alphabet_len = selfies_alphabet_len
         self.max_selfies_len = max_selfies_len
@@ -49,7 +47,6 @@ class SelfiesDecoder(nn.Module):
             self.fc_layers.append(nn.Linear(hidden_size, hidden_size))
             self.fc_layers.append(nn.LayerNorm(hidden_size))
             self.fc_layers.append(activation_fn())
-            self.fc_layers.append(nn.Dropout(dropout_prob))
         
         self.output_layer = nn.Linear(hidden_size, self.output_size)
         self.sigmoid = nn.Sigmoid()
@@ -92,16 +89,15 @@ def main():
     save_dir = "Models"
 
     batch_size = 128
+    input_noise = 0.05
 
-    enc_hidden_size = 1200
-    enc_dropout_prob = 0.0
+    enc_hidden_size = 400
     enc_layers = 3
     enc_activation = nn.GELU
     enc_lr = 1e-3
     enc_weight_decay = 1e-3
 
-    dec_hidden_size = 1200
-    dec_dropout_prob = 0.0
+    dec_hidden_size = 400
     dec_layers = 3
     dec_activation = nn.GELU
     dec_lr = 1e-3
@@ -132,7 +128,6 @@ def main():
     encoder = SelfiesEncoder(len(selfies_alphabet),
                             max_selfies_len=max_selfies_len,
                             hidden_size=enc_hidden_size,
-                            dropout_prob=enc_dropout_prob,
                             num_layers=enc_layers,
                             activation_fn=enc_activation)
     
@@ -140,7 +135,6 @@ def main():
                              max_selfies_len=max_selfies_len,
                              embedding_size=dec_hidden_size,
                              hidden_size=dec_hidden_size,
-                             dropout_prob=dec_dropout_prob,
                              num_layers=dec_layers,
                              activation_fn=dec_activation)
 
@@ -162,9 +156,10 @@ def main():
         train_loss = 0.0
         batch_idx = 0
         for selfies_one_hot, smiles in train_loader:
+            noisy_selfies_one_hot = selfies_one_hot + input_noise * torch.randn_like(selfies_one_hot)
             encoder_optim.zero_grad()
             decoder_optim.zero_grad()
-            selfies_encoding = encoder(selfies_one_hot)
+            selfies_encoding = encoder(noisy_selfies_one_hot)
             selfies_decoding = decoder(selfies_encoding)
             
             loss = criterion(selfies_decoding, selfies_one_hot)
@@ -176,8 +171,8 @@ def main():
             decoder_optim.step()
 
             batch_idx += 1
-            if batch_idx % 5 == 0:
-                print(f"Training Batch Loss = {loss.item()}")
+            # if batch_idx % 5 == 0:
+            #     print(f"Training Batch Loss = {loss.item()}")
 
         print(f"Training Loss = {train_loss / (len(train_dataset) // batch_size)}")
 
@@ -200,8 +195,8 @@ def main():
 
             selfies_probs_np = selfies_decoding.detach().cpu().numpy()
         
-        correct_tokens = 0
-        total_tokens = 0
+        correct_selfies = 0
+        total_selfies = 0
         for batch_idx in range(batch_size):
             selfies_one_hot_og = selfies_one_hot[batch_idx].cpu().numpy()
             selfies_og_tokens = one_hot_decode(selfies_one_hot_og, selfies_alphabet)
@@ -213,10 +208,9 @@ def main():
             selfies_ae_tokens_clean = [token for token in selfies_ae_tokens if token != "[SKIP]"]
             selfies_ae = "".join(selfies_ae_tokens_clean)
 
-            for token_idx in range(len(selfies_og_tokens)):
-                if selfies_og_tokens[token_idx] == selfies_ae_tokens[token_idx]:
-                    correct_tokens += 1
-                total_tokens += 1
+            if selfies_og == selfies_ae:
+                correct_selfies += 1
+            total_selfies += 1
             
             try:
                 smiles_og = sf.decoder(selfies_og)
@@ -227,7 +221,7 @@ def main():
             except Exception as e:
                 print(f"Decoding failed for: {selfies_ae}, Error: {e}")
             
-        print(f"SELFIES Accuracy = {correct_tokens / total_tokens}")
+        print(f"SELFIES Accuracy = {correct_selfies / total_selfies}")
         test_loss = test_loss / (len(test_dataset) // batch_size)
         print(f"Testing Loss = {test_loss}")
         encode_scheduler.step(test_loss)

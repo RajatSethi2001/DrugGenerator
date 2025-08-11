@@ -372,15 +372,13 @@ class DrugGenEnv(gym.Env):
         self.gctx_model.eval()
 
         ae_checkpoint = torch.load(autoencoder_savefile)
-        dec_hidden_size = 1200
-        dec_dropout_prob = 0.0
+        dec_hidden_size = 400
         dec_layers = 3
         dec_activation = nn.GELU
         self.decoder = SelfiesDecoder(len(self.selfies_alphabet),
                                 max_selfies_len=max_selfies_len,
                                 embedding_size=dec_hidden_size,
                                 hidden_size=dec_hidden_size,
-                                dropout_prob=dec_dropout_prob,
                                 num_layers=dec_layers,
                                 activation_fn=dec_activation)
         self.decoder.load_state_dict(ae_checkpoint["decoder_model"])
@@ -412,7 +410,7 @@ class DrugGenEnv(gym.Env):
                 self.condition_expr[filename] = process_gene_csv(filename, self.genes)
         
         self.observation_space = spaces.Box(low=0, high=1, shape=(len(self.genes),), dtype=np.float32)
-        self.action_space = spaces.Box(low=0, high=1, shape=(1202,), dtype=np.float32)
+        self.action_space = spaces.Box(low=0, high=1, shape=(402,), dtype=np.float32)
         self.max_rewards = {filename: 0 for filename in self.condition_expr.keys()}
 
     def step(self, action: np.ndarray):
