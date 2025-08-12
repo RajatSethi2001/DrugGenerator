@@ -13,62 +13,68 @@ from torch.utils.data import Dataset, DataLoader, Subset
 from utils import set_seeds, get_zscore_minmax
 
 class GeneExprEncoder(nn.Module):
-    def __init__(self, num_genes, hidden_size=256, num_layers=2, activation_fn=nn.GELU):
+    def __init__(self, num_genes, hidden_size=512, dropout_prob=0.2):
         super().__init__()
         self.input_layer = nn.Linear(num_genes, hidden_size)
 
-        self.fc_layers = []
-        for _ in range(num_layers):
-            self.fc_layers.append(nn.Linear(hidden_size, hidden_size))
-            self.fc_layers.append(nn.LayerNorm(hidden_size))
-            self.fc_layers.append(activation_fn())
+        self.fc1 = nn.Linear(hidden_size, hidden_size)
+        self.bn1 = nn.LayerNorm(hidden_size)
+        self.fc2 = nn.Linear(hidden_size, hidden_size)
+        self.bn2 = nn.LayerNorm(hidden_size)
         
         self.output_layer = nn.Linear(hidden_size, hidden_size)
         self.sigmoid = nn.Sigmoid()
+        self.activation = nn.GELU()
+        self.dropout = nn.Dropout(dropout_prob)
 
     def forward(self, gene_expr):
         x = self.input_layer(gene_expr)
-        for layer in self.fc_layers:
-            x = layer(x)    
+        x = self.dropout(self.activation(self.bn1(self.fc1(x))))
+        x = self.dropout(self.activation(self.bn2(self.fc2(x))))
         output = self.sigmoid(self.output_layer(x))
         return output
     
 class GeneExprDecoder(nn.Module):
-    def __init__(self, num_genes, embedding_size=256, hidden_size=256, num_layers=2, activation_fn=nn.GELU):
+    def __init__(self, num_genes, embedding_size=512, hidden_size=512, dropout_prob=0.2):
         super().__init__()
         
         self.input_layer = nn.Linear(embedding_size, hidden_size)
-        self.fc_layers = []
-        for _ in range(num_layers):
-            self.fc_layers.append(nn.Linear(hidden_size, hidden_size))
-            self.fc_layers.append(nn.LayerNorm(hidden_size))
-            self.fc_layers.append(activation_fn())
+        self.fc1 = nn.Linear(hidden_size, hidden_size)
+        self.bn1 = nn.LayerNorm(hidden_size)
+        self.fc2 = nn.Linear(hidden_size, hidden_size)
+        self.bn2 = nn.LayerNorm(hidden_size)
         
         self.output_layer = nn.Linear(hidden_size, num_genes)
         self.sigmoid = nn.Sigmoid()
+        self.activation = nn.GELU()
+        self.dropout = nn.Dropout(dropout_prob)
 
     def forward(self, embedding):
         x = self.input_layer(embedding)
-        for layer in self.fc_layers:
-            x = layer(x)    
+        x = self.dropout(self.activation(self.bn1(self.fc1(x))))
+        x = self.dropout(self.activation(self.bn2(self.fc2(x))))
         output = self.sigmoid(self.output_layer(x))
         return output
 
 class GeneExprDataset(Dataset):
-    def __init__(self, gctx_file, data_limit=10000):
+    def __init__(self, gctx_file, data_limit=20000):
         self.gctx_fp = h5py.File(gctx_file, "r")
         
-        data_idx = random.sample(range(0, len(self.gctx_fp["0/META/COL/id"])), data_limit)
+        data_idx = random.sample(range(len(self.gctx_fp["0/META/COL/id"]) // 2, len(self.gctx_fp["0/META/COL/id"])), data_limit)
         data_idx.sort()
         data_idx = np.array(data_idx)
+
+        print("Collecting Matrix Data")
+        data_matrix = np.array(self.gctx_fp["0/DATA/0/matrix"][data_idx, :])
+        print("Matrix Data Collected")
 
         self.gene_symbols = [s.decode("utf-8") for s in self.gctx_fp["/0/META/ROW/pr_gene_symbol"]]
         self.important_genes = pd.read_csv("Data/important_genes.csv", header=None)[0].to_list()
         self.gene_idx = np.array([self.gene_symbols.index(gene) for gene in self.important_genes])
 
         data_list = []
-        for idx in range(data_limit):
-            data_list.append(get_zscore_minmax(np.array(self.gctx_fp["0/DATA/0/matrix"][idx, :])[self.gene_idx]))
+        for idx in range(len(data_matrix)):
+            data_list.append(get_zscore_minmax(data_matrix[idx, self.gene_idx]))
         
         self.data_arr = np.array(data_list)
         print(self.data_arr)
@@ -85,7 +91,7 @@ class GeneExprDataset(Dataset):
         return self.important_genes
 
 def main():
-    set_seeds(111)
+    set_seeds(1111)
     train_test_split = 0.2
     save_dir = "Models"
     gctx_file = "Data/annotated_GSE92742_Broad_LINCS_Level5_COMPZ_n473647x12328.gctx"
@@ -93,17 +99,9 @@ def main():
     batch_size = 128
     input_noise = 0.01
 
-    enc_hidden_size = 512
-    enc_layers = 2
-    enc_activation = nn.GELU
-    enc_lr = 1e-3
-    enc_weight_decay = 1e-3
-
-    dec_hidden_size = 512
-    dec_layers = 2
-    dec_activation = nn.GELU
-    dec_lr = 1e-3
-    dec_weight_decay = 1e-3
+    hidden_size = 512
+    lr = 1e-4
+    weight_decay = 1e-3
     
     dataset = GeneExprDataset(gctx_file)
     train_size = int(len(dataset) * (1 - train_test_split))
@@ -121,18 +119,14 @@ def main():
 
     criterion = nn.MSELoss()
     encoder = GeneExprEncoder(len(dataset.get_gene_symbols()),
-                              hidden_size=enc_hidden_size,
-                              num_layers=enc_layers,
-                              activation_fn=enc_activation)
+                              hidden_size=hidden_size)
     
     decoder = GeneExprDecoder(len(dataset.get_gene_symbols()),
-                              embedding_size=enc_hidden_size,
-                              hidden_size=dec_hidden_size,
-                              num_layers=dec_layers,
-                              activation_fn=dec_activation)
+                              embedding_size=hidden_size,
+                              hidden_size=hidden_size)
 
-    encoder_optim = optim.AdamW(encoder.parameters(), lr=enc_lr, weight_decay=enc_weight_decay)
-    decoder_optim = optim.AdamW(decoder.parameters(), lr=dec_lr, weight_decay=dec_weight_decay)
+    encoder_optim = optim.AdamW(encoder.parameters(), lr=lr, weight_decay=weight_decay)
+    decoder_optim = optim.AdamW(decoder.parameters(), lr=lr, weight_decay=weight_decay)
 
     if os.path.exists(f"{save_dir}/gene_expr_autoencoder.pth"):
         checkpoint = torch.load(f"{save_dir}/gene_expr_autoencoder.pth")
@@ -179,15 +173,24 @@ def main():
         encoder.eval()
         decoder.eval()
         test_loss = 0.0
-        for gene_expr in test_loader:
-            gene_expr_encoding = encoder(gene_expr)
-            gene_expr_decoding = decoder(gene_expr_encoding)
+        with torch.no_grad():
+            for gene_expr in test_loader:
+                gene_expr_encoding = encoder(gene_expr)
+                gene_expr_decoding = decoder(gene_expr_encoding)
 
-            loss = criterion(gene_expr_decoding, gene_expr)
-            test_loss += loss.item()
+                loss = criterion(gene_expr_decoding, gene_expr)
+                test_loss += loss.item()
+
+            sample_original = gene_expr[:5]
+            sample_reconstructed = decoder(encoder(sample_original))
+
+            print("Original:", sample_original[0, :10].numpy())
+            print("Reconstructed:", sample_reconstructed[0, :10].numpy())
+            print("Diff:", (sample_original[0, :10] - sample_reconstructed[0, :10]).numpy())
 
         test_loss = test_loss / (len(test_dataset) // batch_size)
         print(f"Testing Loss = {test_loss}")
+        
         encode_scheduler.step(test_loss)
         decode_scheduler.step(test_loss)
 

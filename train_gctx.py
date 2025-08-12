@@ -59,19 +59,23 @@ class PearsonCorrLoss(nn.Module):
         return 1 - r.mean()
 
 class GenePertDataset(Dataset):
-    def __init__(self, gctx_file, compound_file, data_limit=10000, max_selfies_len=50, gene_ae_hidden_size=512, selfies_ae_hidden_size=1024):
+    def __init__(self, gctx_file, compound_file, data_limit=40000, max_selfies_len=50, gene_ae_hidden_size=512, selfies_ae_hidden_size=512):
         self.gctx_fp = h5py.File(gctx_file, "r")
         
-        data_idx = random.sample(range(0, len(self.gctx_fp["0/META/COL/id"])), data_limit)
+        data_idx = random.sample(range(0, len(self.gctx_fp["0/META/COL/id"]) // 2), data_limit)
         data_idx.sort()
         data_idx = np.array(data_idx)
+
+        print("Collecting Data Matrix")
+        data_matrix = np.array(self.gctx_fp["0/DATA/0/matrix"][data_idx, :])
+        print("Data Matrix Collected")
 
         self.ids = [s.decode('utf-8') for s in self.gctx_fp["0/META/COL/id"][data_idx]]
         self.pert_types = [s.decode('utf-8') for s in self.gctx_fp["0/META/COL/pert_type"][data_idx]]
         self.pert_id = [s.decode('utf-8') for s in self.gctx_fp["0/META/COL/pert_id"][data_idx]]
         self.gene_symbols = [s.decode("utf-8") for s in self.gctx_fp["/0/META/ROW/pr_gene_symbol"]]
 
-        print("Data Collected")
+        print("Metadata Collected")
 
         compound_df = pd.read_csv(compound_file, sep="\t")
         self.smiles_lookup = compound_df.set_index("pert_id")["canonical_smiles"].to_dict()
@@ -141,7 +145,7 @@ class GenePertDataset(Dataset):
         for condition_id, gene_data in data_map_items:
             ctl_exprs = []
             for ctl_idx in gene_data["ctl_idx"]:
-                ctl_expr_total = np.array(self.gctx_fp["0/DATA/0/matrix"][ctl_idx, :])
+                ctl_expr_total = np.array(data_matrix[ctl_idx, :])
                 ctl_expr = get_zscore_minmax(ctl_expr_total)[self.gene_idx]
                 ctl_exprs.append(ctl_expr)
             
@@ -160,7 +164,7 @@ class GenePertDataset(Dataset):
 
             for trt_idx in gene_data["trt_idx"]:
                 try:
-                    trt_expr_total = np.array(self.gctx_fp["0/DATA/0/matrix"][trt_idx, :])
+                    trt_expr_total = np.array(data_matrix[trt_idx, :])
                     trt_expr = torch.tensor(get_zscore_minmax(trt_expr_total)[self.gene_idx], dtype=torch.float32).unsqueeze(0)
                     with torch.no_grad():
                         trt_expr = self.gene_expr_encoder(trt_expr)[0]
@@ -192,7 +196,7 @@ class GenePertDataset(Dataset):
         return self.important_genes
 
 class GenePertModel(nn.Module):
-    def __init__(self, gene_embedding_len, selfies_embedding_len, hidden_size=1024, dropout_prob=0.3, activation_fn=nn.GELU):
+    def __init__(self, gene_embedding_len, selfies_embedding_len, hidden_size=512, dropout_prob=0.2, activation_fn=nn.GELU):
         super().__init__()
         self.input_size = gene_embedding_len + selfies_embedding_len
         self.input_layer = nn.Linear(self.input_size, hidden_size)
@@ -238,7 +242,7 @@ class GenePertModel(nn.Module):
         return output
 
 def main():
-    set_seeds(1111)
+    set_seeds(3333)
 
     train_test_split = 0.2
     dataset = GenePertDataset("Data/annotated_GSE92742_Broad_LINCS_Level5_COMPZ_n473647x12328.gctx", "Data/compoundinfo_beta.txt")
@@ -246,7 +250,7 @@ def main():
 
     train_size = int(len(dataset) * (1 - train_test_split))
     indices = list(range(len(dataset)))
-    random.shuffle(indices)
+    # random.shuffle(indices)
     train_indices = indices[:train_size]
     test_indices = indices[train_size:]
 
@@ -260,7 +264,7 @@ def main():
     criterion = nn.MSELoss()
     training_noise = 0.02
 
-    model = GenePertModel(512, 1024, 1024, dropout_prob=0.2, activation_fn=nn.GELU)
+    model = GenePertModel(512, 512, 512, dropout_prob=0.2, activation_fn=nn.GELU)
     optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-3, betas=(0.9, 0.999))
 
     if os.path.exists(model_savefile):
@@ -300,12 +304,17 @@ def main():
         model.eval()
         test_loss = 0
         batch = 0
+        total_pred_expr = torch.tensor([], dtype=torch.float32)
+        total_trt_expr = torch.tensor([], dtype=torch.float32)
         for ctl_expr, trt_expr, smiles_embedding in test_loader:
             pred_expr = model(ctl_expr, smiles_embedding)
             loss = criterion(pred_expr, trt_expr)
             test_loss += loss.item()
 
             batch += 1
+
+            total_pred_expr = torch.cat([total_pred_expr, pred_expr])
+            total_trt_expr = torch.cat([total_trt_expr, trt_expr])
 
             # pred_std = pred_expr.std(dim=1).mean().item()
             # tgt_std  = trt_expr.std(dim=1).mean().item()
@@ -323,8 +332,9 @@ def main():
 
             # print(f"Test Batch {batch}: Loss = {loss.item()}")
 
-        test_loss /= batch   
-        print(f"Testing Loss = {test_loss}, Pearson-R = {pearsonr(pred_expr.detach().numpy()[0], trt_expr.detach().numpy()[0])[0]}")
+        test_loss /= batch
+        pearson_corr_list = [pearsonr(total_pred_expr.detach().numpy()[idx], total_trt_expr.detach().numpy()[idx])[0] for idx in range(len(total_pred_expr))]
+        print(f"Testing Loss = {test_loss}, Pearson-R = {np.median(pearson_corr_list)}")
 
 if __name__=="__main__":
     main()

@@ -37,7 +37,7 @@ class AllGenePertDataset(Dataset):
             self.selfies_alphabet = f.read().splitlines()
 
         data_map = {}
-        for idx in range(data_limit):
+        for idx in data_idx:
             id_parts = self.ids[idx].split(":")
         
             if len(id_parts) < 2:

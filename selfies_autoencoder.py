@@ -12,49 +12,51 @@ from torch.utils.data import Dataset, DataLoader, Subset
 from utils import one_hot_encode, one_hot_decode, set_seeds
 
 class SelfiesEncoder(nn.Module):
-    def __init__(self, selfies_alphabet_len, max_selfies_len=50, hidden_size=1500, num_layers=2, activation_fn=nn.ReLU):
+    def __init__(self, selfies_alphabet_len, max_selfies_len=50, hidden_size=512, dropout_prob=0.0):
         super().__init__()
         self.input_size = selfies_alphabet_len * max_selfies_len
         self.input_layer = nn.Linear(self.input_size, hidden_size)
 
-        self.fc_layers = []
-        for _ in range(num_layers):
-            self.fc_layers.append(nn.Linear(hidden_size, hidden_size))
-            self.fc_layers.append(nn.LayerNorm(hidden_size))
-            self.fc_layers.append(activation_fn())
+        self.fc1 = nn.Linear(hidden_size, hidden_size)
+        self.bn1 = nn.LayerNorm(hidden_size)
+        self.fc2 = nn.Linear(hidden_size, hidden_size)
+        self.bn2 = nn.LayerNorm(hidden_size)
         
         self.output_layer = nn.Linear(hidden_size, hidden_size)
         self.sigmoid = nn.Sigmoid()
+        self.activation = nn.GELU()
+        self.dropout = nn.Dropout(dropout_prob)
 
     def forward(self, selfies_one_hot):
         x = selfies_one_hot.reshape(-1, self.input_size)
         x = self.input_layer(x)
-        for layer in self.fc_layers:
-            x = layer(x)    
+        x = self.dropout(self.activation(self.bn1(self.fc1(x))))
+        x = self.dropout(self.activation(self.bn2(self.fc2(x))))
         output = self.sigmoid(self.output_layer(x))
         return output
     
 class SelfiesDecoder(nn.Module):
-    def __init__(self, selfies_alphabet_len, max_selfies_len=50, embedding_size=1500, hidden_size=1500, num_layers=2, activation_fn=nn.ReLU):
+    def __init__(self, selfies_alphabet_len, max_selfies_len=50, embedding_size=512, hidden_size=512, dropout_prob=0.0):
         super().__init__()
         self.selfies_alphabet_len = selfies_alphabet_len
         self.max_selfies_len = max_selfies_len
         self.output_size = selfies_alphabet_len * max_selfies_len
         
         self.input_layer = nn.Linear(embedding_size, hidden_size)
-        self.fc_layers = []
-        for _ in range(num_layers):
-            self.fc_layers.append(nn.Linear(hidden_size, hidden_size))
-            self.fc_layers.append(nn.LayerNorm(hidden_size))
-            self.fc_layers.append(activation_fn())
+        self.fc1 = nn.Linear(hidden_size, hidden_size)
+        self.bn1 = nn.LayerNorm(hidden_size)
+        self.fc2 = nn.Linear(hidden_size, hidden_size)
+        self.bn2 = nn.LayerNorm(hidden_size)
         
         self.output_layer = nn.Linear(hidden_size, self.output_size)
         self.sigmoid = nn.Sigmoid()
+        self.activation = nn.GELU()
+        self.dropout = nn.Dropout(dropout_prob)
 
     def forward(self, selfies_embedding):
         x = self.input_layer(selfies_embedding)
-        for layer in self.fc_layers:
-            x = layer(x)    
+        x = self.dropout(self.activation(self.bn1(self.fc1(x))))
+        x = self.dropout(self.activation(self.bn2(self.fc2(x))))
         output = self.sigmoid(self.output_layer(x))
         output = output.view(-1, self.max_selfies_len, self.selfies_alphabet_len)
         return output
@@ -83,28 +85,20 @@ class SelfiesDataset(Dataset):
         return self.selfies_one_hot_list[index], self.smiles_list[index]
 
 def main():
+    set_seeds(2222)
     train_test_split = 0.2
     max_selfies_len = 50
-    compound_file = "Data/compoundinfo_beta.txt"
+    compound_file = "Data/chembl_35_chemreps.txt"
     save_dir = "Models"
 
     batch_size = 128
-    input_noise = 0.05
+    input_noise = 0.02
 
-    enc_hidden_size = 1024
-    enc_layers = 2
-    enc_activation = nn.GELU
-    enc_lr = 1e-3
-    enc_weight_decay = 1e-3
+    hidden_size = 512
+    lr = 1e-5
+    weight_decay = 1e-3
 
-    dec_hidden_size = 1024
-    dec_layers = 2
-    dec_activation = nn.GELU
-    dec_lr = 1e-3
-    dec_weight_decay = 1e-3
-
-    set_seeds()
-    compound_df = pd.read_csv(compound_file, sep="\t")
+    compound_df = pd.read_csv(compound_file, sep="\t", nrows=50000)
     smiles_list = compound_df["canonical_smiles"].to_list()
 
     with open("Data/selfies_alphabet.txt", "r") as f:
@@ -127,27 +121,23 @@ def main():
     criterion = nn.BCELoss()
     encoder = SelfiesEncoder(len(selfies_alphabet),
                             max_selfies_len=max_selfies_len,
-                            hidden_size=enc_hidden_size,
-                            num_layers=enc_layers,
-                            activation_fn=enc_activation)
+                            hidden_size=hidden_size)
     
     decoder = SelfiesDecoder(len(selfies_alphabet),
                              max_selfies_len=max_selfies_len,
-                             embedding_size=enc_hidden_size,
-                             hidden_size=dec_hidden_size,
-                             num_layers=dec_layers,
-                             activation_fn=dec_activation)
+                             embedding_size=hidden_size,
+                             hidden_size=hidden_size)
 
-    encoder_optim = optim.AdamW(encoder.parameters(), lr=enc_lr, weight_decay=enc_weight_decay)
-    decoder_optim = optim.AdamW(decoder.parameters(), lr=dec_lr, weight_decay=dec_weight_decay)
+    encoder_optim = optim.AdamW(encoder.parameters(), lr=lr, weight_decay=weight_decay)
+    decoder_optim = optim.AdamW(decoder.parameters(), lr=lr, weight_decay=weight_decay)
 
     if os.path.exists(f"{save_dir}/selfies_autoencoder.pth"):
         checkpoint = torch.load(f"{save_dir}/selfies_autoencoder.pth")
         encoder.load_state_dict(checkpoint["encoder_model"])
         decoder.load_state_dict(checkpoint["decoder_model"])
 
-    encode_scheduler = ReduceLROnPlateau(encoder_optim, mode='min', factor=0.3, patience=3, threshold=1e-2)
-    decode_scheduler = ReduceLROnPlateau(decoder_optim, mode='min', factor=0.3, patience=3, threshold=1e-2)
+    encode_scheduler = ReduceLROnPlateau(encoder_optim, mode='min', factor=0.3, patience=3, threshold=1e-3)
+    decode_scheduler = ReduceLROnPlateau(decoder_optim, mode='min', factor=0.3, patience=3, threshold=1e-3)
 
     for epoch in range(250):
         print(f"Epoch {epoch}")
