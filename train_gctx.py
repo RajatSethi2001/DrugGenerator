@@ -7,6 +7,7 @@ import selfies as sf
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from gene_expr_autoencoder import GeneExprEncoder, GeneExprDecoder
 from scipy.stats import pearsonr
 from selfies_autoencoder import SelfiesEncoder, SelfiesDecoder
 from torch.utils.data import Dataset, DataLoader, Subset
@@ -58,7 +59,7 @@ class PearsonCorrLoss(nn.Module):
         return 1 - r.mean()
 
 class GenePertDataset(Dataset):
-    def __init__(self, gctx_file, compound_file, data_limit=40000, max_selfies_len=50):
+    def __init__(self, gctx_file, compound_file, data_limit=10000, max_selfies_len=50, gene_ae_hidden_size=512, selfies_ae_hidden_size=1024):
         self.gctx_fp = h5py.File(gctx_file, "r")
         
         data_idx = random.sample(range(0, len(self.gctx_fp["0/META/COL/id"])), data_limit)
@@ -66,10 +67,6 @@ class GenePertDataset(Dataset):
         data_idx = np.array(data_idx)
 
         self.ids = [s.decode('utf-8') for s in self.gctx_fp["0/META/COL/id"][data_idx]]
-        self.pert_dose = [float(s.decode('utf-8').split("|")[0]) for s in self.gctx_fp["0/META/COL/pert_dose"][data_idx]]
-        self.pert_dose_units = [clean_dose_unit(s) for s in self.gctx_fp["0/META/COL/pert_dose_unit"][data_idx]]
-        self.pert_time = [float(s) for s in self.gctx_fp["0/META/COL/pert_time"][data_idx]]
-        self.pert_time_units = [s.decode('utf-8') for s in self.gctx_fp["0/META/COL/pert_time_unit"][data_idx]]
         self.pert_types = [s.decode('utf-8') for s in self.gctx_fp["0/META/COL/pert_type"][data_idx]]
         self.pert_id = [s.decode('utf-8') for s in self.gctx_fp["0/META/COL/pert_id"][data_idx]]
         self.gene_symbols = [s.decode("utf-8") for s in self.gctx_fp["/0/META/ROW/pr_gene_symbol"]]
@@ -102,8 +99,6 @@ class GenePertDataset(Dataset):
                 data_map[condition]["ctl_idx"].append(idx)
 
             elif pert_type == "trt_cp":
-                pert_dose_unit = self.pert_dose_units[idx]
-                pert_time_unit = self.pert_time_units[idx]
                 pert_id = self.pert_id[idx]
                 if pert_id not in self.smiles_lookup:
                     continue
@@ -114,7 +109,7 @@ class GenePertDataset(Dataset):
                 except:
                     continue
 
-                if pert_dose_unit == "uM" and pert_time_unit == "h" and len(selfies_tokens) <= self.max_selfies_len:
+                if len(selfies_tokens) <= self.max_selfies_len:
                     data_map[condition]["trt_idx"].append(idx)
         
         valid_conditions = {}
@@ -124,32 +119,21 @@ class GenePertDataset(Dataset):
                 print(f"Condition {condition}: {len(data['ctl_idx'])} controls, {len(data['trt_idx'])} treatments")
             else:
                 print(f"Condition {condition} has no valid mappings")
-        
-        enc_hidden_size = 400
-        enc_layers = 3
-        enc_activation = nn.GELU
 
-        dec_hidden_size = 400
-        dec_layers = 3
-        dec_activation = nn.GELU
+        self.gene_expr_encoder = GeneExprEncoder(len(self.important_genes),
+                                                 hidden_size=gene_ae_hidden_size)
 
-        self.encoder = SelfiesEncoder(len(self.selfies_alphabet),
-                            max_selfies_len=max_selfies_len,
-                            hidden_size=enc_hidden_size,
-                            num_layers=enc_layers,
-                            activation_fn=enc_activation)
-    
-        self.decoder = SelfiesDecoder(len(self.selfies_alphabet),
-                                max_selfies_len=max_selfies_len,
-                                embedding_size=dec_hidden_size,
-                                hidden_size=dec_hidden_size,
-                                num_layers=dec_layers,
-                                activation_fn=dec_activation)
-        ae_checkpoint = torch.load("Models/selfies_autoencoder.pth")
-        self.encoder.load_state_dict(ae_checkpoint["encoder_model"])
-        self.decoder.load_state_dict(ae_checkpoint["decoder_model"])
-        self.encoder.eval()
-        self.decoder.eval()
+        gene_expr_ae_checkpoint = torch.load("Models/gene_expr_autoencoder.pth")
+        self.gene_expr_encoder.load_state_dict(gene_expr_ae_checkpoint["encoder_model"])
+        self.gene_expr_encoder.eval()
+
+        self.selfies_encoder = SelfiesEncoder(len(self.selfies_alphabet),
+                                              max_selfies_len=max_selfies_len,
+                                              hidden_size=selfies_ae_hidden_size)
+
+        selfies_ae_checkpoint = torch.load("Models/selfies_autoencoder.pth")
+        self.selfies_encoder.load_state_dict(selfies_ae_checkpoint["encoder_model"])
+        self.selfies_encoder.eval()
 
         self.gctx_data = []
         data_map_items = list(valid_conditions.items())
@@ -170,18 +154,20 @@ class GenePertDataset(Dataset):
             if np.isnan(ctl_expr_median).any():
                 continue
                 
-            ctl_expr_median = torch.tensor(ctl_expr_median, dtype=torch.float32)
+            ctl_expr_median = torch.tensor(ctl_expr_median, dtype=torch.float32).unsqueeze(0)
+            with torch.no_grad():
+                ctl_expr_median = self.gene_expr_encoder(ctl_expr_median)[0]
 
             for trt_idx in gene_data["trt_idx"]:
                 try:
                     trt_expr_total = np.array(self.gctx_fp["0/DATA/0/matrix"][trt_idx, :])
-                    trt_expr = torch.tensor(get_zscore_minmax(trt_expr_total)[self.gene_idx], dtype=torch.float32)
-                    dose = torch.tensor([np.log1p(self.pert_dose[trt_idx])], dtype=torch.float32)
-                    time = torch.tensor([np.log1p(self.pert_time[trt_idx])], dtype=torch.float32)
-                    smiles = self.smiles_lookup[self.pert_id[trt_idx]]
-                    smiles_embedding = torch.tensor(smiles_to_embedding(smiles, self.selfies_alphabet, self.encoder), dtype=torch.float32)
+                    trt_expr = torch.tensor(get_zscore_minmax(trt_expr_total)[self.gene_idx], dtype=torch.float32).unsqueeze(0)
+                    with torch.no_grad():
+                        trt_expr = self.gene_expr_encoder(trt_expr)[0]
+                        smiles = self.smiles_lookup[self.pert_id[trt_idx]]
+                        smiles_embedding = torch.tensor(smiles_to_embedding(smiles, self.selfies_alphabet, self.selfies_encoder), dtype=torch.float32)
 
-                    self.gctx_data.append((ctl_expr_median, trt_expr, smiles_embedding, dose, time))
+                    self.gctx_data.append((ctl_expr_median, trt_expr, smiles_embedding))
                 except Exception as e:
                     print(f"Error processing treatment {trt_idx}: {e}")
                     continue
@@ -189,10 +175,6 @@ class GenePertDataset(Dataset):
             print(f"Conditions Processed: {len(self.gctx_data)}")
         
         del self.ids
-        del self.pert_dose
-        del self.pert_dose_units
-        del self.pert_time
-        del self.pert_time_units
         del self.pert_types
         del self.pert_id
         self.gctx_fp.close()
@@ -210,9 +192,9 @@ class GenePertDataset(Dataset):
         return self.important_genes
 
 class GenePertModel(nn.Module):
-    def __init__(self, num_genes, embedding_len, hidden_size=384, dropout_prob=0.3, activation_fn=nn.GELU):
+    def __init__(self, gene_embedding_len, selfies_embedding_len, hidden_size=1024, dropout_prob=0.3, activation_fn=nn.GELU):
         super().__init__()
-        self.input_size = num_genes + embedding_len + 2
+        self.input_size = gene_embedding_len + selfies_embedding_len
         self.input_layer = nn.Linear(self.input_size, hidden_size)
 
         self.fc1 = nn.Linear(hidden_size, hidden_size)
@@ -224,7 +206,7 @@ class GenePertModel(nn.Module):
         self.fc3 = nn.Linear(hidden_size, hidden_size)
         self.bn3 = nn.LayerNorm(hidden_size)
         
-        self.output_layer = nn.Linear(hidden_size, num_genes)
+        self.output_layer = nn.Linear(hidden_size, gene_embedding_len)
 
         self.activation = activation_fn()
         self.sigmoid = nn.Sigmoid()
@@ -239,8 +221,8 @@ class GenePertModel(nn.Module):
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
     
-    def forward(self, ctl_expr, smiles_embedding, dose, time):
-        x = torch.cat((ctl_expr, smiles_embedding, dose, time), dim=-1)
+    def forward(self, ctl_expr, smiles_embedding):
+        x = torch.cat((ctl_expr, smiles_embedding), dim=-1)
         x = self.input_layer(x)
         residual = x
         x = self.dropout(self.activation(self.bn1(self.fc1(x))))
@@ -252,7 +234,7 @@ class GenePertModel(nn.Module):
 
         x = self.dropout(self.activation(self.bn3(self.fc3(x))))
 
-        output = nn.Tanh()(self.output_layer(x))
+        output = self.sigmoid(self.output_layer(x))
         return output
 
 def main():
@@ -275,12 +257,10 @@ def main():
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
 
-    criterion = nn.SmoothL1Loss()
-    pearson_loss = PearsonCorrLoss()
-    pearson_loss_weight = 0.01
+    criterion = nn.MSELoss()
     training_noise = 0.02
 
-    model = GenePertModel(len(dataset.get_gene_symbols()), 400, 400, dropout_prob=0.2, activation_fn=nn.GELU)
+    model = GenePertModel(512, 1024, 1024, dropout_prob=0.2, activation_fn=nn.GELU)
     optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-3, betas=(0.9, 0.999))
 
     if os.path.exists(model_savefile):
@@ -294,18 +274,13 @@ def main():
         model.train()
         train_loss = 0
         batch = 0
-        for ctl_expr, trt_expr, smiles_embedding, dose, time in train_loader:
+        for ctl_expr, trt_expr, smiles_embedding in train_loader:
             optimizer.zero_grad()
             noisy_ctl_expr = ctl_expr + training_noise * torch.randn_like(ctl_expr)  # small Gaussian noise
             noisy_smiles_embedding = smiles_embedding + training_noise * torch.randn_like(smiles_embedding)
-            pred_delta_expr = model(noisy_ctl_expr, noisy_smiles_embedding, dose, time)
-            pred_expr = ctl_expr + pred_delta_expr
-
-            pred_var = pred_expr.var(dim=1).mean()
-            trt_var  = trt_expr.var(dim=1).mean()
+            pred_expr = model(noisy_ctl_expr, noisy_smiles_embedding)
 
             loss = criterion(pred_expr, trt_expr)
-            loss = loss + 0.01 * torch.abs(pred_var - trt_var)
             loss.backward()
             optimizer.step()
 
@@ -325,25 +300,24 @@ def main():
         model.eval()
         test_loss = 0
         batch = 0
-        for ctl_expr, trt_expr, smiles_embedding, dose, time in test_loader:
-            pred_delta_expr = model(ctl_expr, smiles_embedding, dose, time)
-            pred_expr = ctl_expr + pred_delta_expr
+        for ctl_expr, trt_expr, smiles_embedding in test_loader:
+            pred_expr = model(ctl_expr, smiles_embedding)
             loss = criterion(pred_expr, trt_expr)
             test_loss += loss.item()
 
             batch += 1
 
-            pred_std = pred_expr.std(dim=1).mean().item()
-            tgt_std  = trt_expr.std(dim=1).mean().item()
-            print("pred_std:", pred_std, "tgt_std:", tgt_std)
+            # pred_std = pred_expr.std(dim=1).mean().item()
+            # tgt_std  = trt_expr.std(dim=1).mean().item()
+            # print("pred_std:", pred_std, "tgt_std:", tgt_std)
             
-            r_list = []
-            for i in range(pred_expr.shape[0]):
-                r_list.append(pearsonr(pred_expr[i].detach().numpy(), trt_expr[i].detach().numpy())[0])
-            print(np.percentile(r_list,[5,25,50,75,95]), np.mean(r_list))
+            # r_list = []
+            # for i in range(pred_expr.shape[0]):
+            #     r_list.append(pearsonr(pred_expr[i].detach().numpy(), trt_expr[i].detach().numpy())[0])
+            # print(np.percentile(r_list,[5,25,50,75,95]), np.mean(r_list))
 
-            per_gene_r = [pearsonr(pred_expr[:,g].detach().numpy(), trt_expr[:,g].detach().numpy())[0] for g in range(400)]
-            print(np.percentile(per_gene_r,[5,25,50,75,95]), np.mean(per_gene_r))
+            # per_gene_r = [pearsonr(pred_expr[:,g].detach().numpy(), trt_expr[:,g].detach().numpy())[0] for g in range(len(dataset.get_gene_symbols()))]
+            # print(np.percentile(per_gene_r,[5,25,50,75,95]), np.mean(per_gene_r))
 
             # input()
 

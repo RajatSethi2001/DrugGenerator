@@ -91,14 +91,14 @@ def main():
     batch_size = 128
     input_noise = 0.05
 
-    enc_hidden_size = 400
-    enc_layers = 3
+    enc_hidden_size = 1024
+    enc_layers = 2
     enc_activation = nn.GELU
     enc_lr = 1e-3
     enc_weight_decay = 1e-3
 
-    dec_hidden_size = 400
-    dec_layers = 3
+    dec_hidden_size = 1024
+    dec_layers = 2
     dec_activation = nn.GELU
     dec_lr = 1e-3
     dec_weight_decay = 1e-3
@@ -133,7 +133,7 @@ def main():
     
     decoder = SelfiesDecoder(len(selfies_alphabet),
                              max_selfies_len=max_selfies_len,
-                             embedding_size=dec_hidden_size,
+                             embedding_size=enc_hidden_size,
                              hidden_size=dec_hidden_size,
                              num_layers=dec_layers,
                              activation_fn=dec_activation)
