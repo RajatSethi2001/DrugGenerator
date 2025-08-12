@@ -59,21 +59,31 @@ class PearsonCorrLoss(nn.Module):
         return 1 - r.mean()
 
 class GenePertDataset(Dataset):
-    def __init__(self, gctx_file, compound_file, data_limit=40000, max_selfies_len=50, gene_ae_hidden_size=512, selfies_ae_hidden_size=512):
+    def __init__(self, gctx_file, compound_file, data_limit=80000, max_selfies_len=50, gene_ae_hidden_size=512, selfies_ae_hidden_size=512):
         self.gctx_fp = h5py.File(gctx_file, "r")
         
         data_idx = random.sample(range(0, len(self.gctx_fp["0/META/COL/id"]) // 2), data_limit)
         data_idx.sort()
         data_idx = np.array(data_idx)
 
-        print("Collecting Data Matrix")
-        data_matrix = np.array(self.gctx_fp["0/DATA/0/matrix"][data_idx, :])
-        print("Data Matrix Collected")
+        self.gene_symbols = [s.decode("utf-8") for s in self.gctx_fp["/0/META/ROW/pr_gene_symbol"]]
+        self.important_genes = pd.read_csv("Data/important_genes.csv", header=None)[0].to_list()
+        self.gene_idx = np.array([self.gene_symbols.index(gene) for gene in self.important_genes])
+
+        data_list = []
+        for data_start in range(0, data_limit, 1000):
+            print(f"Processing Data Point {data_start}")
+            data_end = data_start + min(1000, data_limit - data_start)
+            data_idx_window = data_idx[data_start:data_end]
+            data_matrix = np.array(self.gctx_fp["0/DATA/0/matrix"][data_idx_window, :])[:, self.gene_idx]
+            data_list.append(data_matrix)
+        data_matrix = np.concatenate(data_list)
+        print(data_matrix.shape)
+        print(data_matrix)
 
         self.ids = [s.decode('utf-8') for s in self.gctx_fp["0/META/COL/id"][data_idx]]
         self.pert_types = [s.decode('utf-8') for s in self.gctx_fp["0/META/COL/pert_type"][data_idx]]
         self.pert_id = [s.decode('utf-8') for s in self.gctx_fp["0/META/COL/pert_id"][data_idx]]
-        self.gene_symbols = [s.decode("utf-8") for s in self.gctx_fp["/0/META/ROW/pr_gene_symbol"]]
 
         print("Metadata Collected")
 
@@ -81,8 +91,6 @@ class GenePertDataset(Dataset):
         self.smiles_lookup = compound_df.set_index("pert_id")["canonical_smiles"].to_dict()
         self.max_selfies_len = max_selfies_len
 
-        self.important_genes = pd.read_csv("Data/important_genes.csv", header=None)[0].to_list()
-        self.gene_idx = np.array([self.gene_symbols.index(gene) for gene in self.important_genes])
         with open("Data/selfies_alphabet.txt", "r") as f:
             self.selfies_alphabet = f.read().splitlines()
 
@@ -146,7 +154,7 @@ class GenePertDataset(Dataset):
             ctl_exprs = []
             for ctl_idx in gene_data["ctl_idx"]:
                 ctl_expr_total = np.array(data_matrix[ctl_idx, :])
-                ctl_expr = get_zscore_minmax(ctl_expr_total)[self.gene_idx]
+                ctl_expr = get_zscore_minmax(ctl_expr_total)
                 ctl_exprs.append(ctl_expr)
             
             if len(ctl_exprs) == 0:
@@ -165,7 +173,7 @@ class GenePertDataset(Dataset):
             for trt_idx in gene_data["trt_idx"]:
                 try:
                     trt_expr_total = np.array(data_matrix[trt_idx, :])
-                    trt_expr = torch.tensor(get_zscore_minmax(trt_expr_total)[self.gene_idx], dtype=torch.float32).unsqueeze(0)
+                    trt_expr = torch.tensor(get_zscore_minmax(trt_expr_total), dtype=torch.float32).unsqueeze(0)
                     with torch.no_grad():
                         trt_expr = self.gene_expr_encoder(trt_expr)[0]
                         smiles = self.smiles_lookup[self.pert_id[trt_idx]]

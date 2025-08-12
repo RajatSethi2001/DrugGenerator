@@ -57,24 +57,31 @@ class GeneExprDecoder(nn.Module):
         return output
 
 class GeneExprDataset(Dataset):
-    def __init__(self, gctx_file, data_limit=20000):
+    def __init__(self, gctx_file, data_limit=30000):
         self.gctx_fp = h5py.File(gctx_file, "r")
+
+        self.gene_symbols = [s.decode("utf-8") for s in self.gctx_fp["/0/META/ROW/pr_gene_symbol"]]
+        self.important_genes = pd.read_csv("Data/important_genes.csv", header=None)[0].to_list()
+        self.gene_idx = np.array([self.gene_symbols.index(gene) for gene in self.important_genes])
         
         data_idx = random.sample(range(len(self.gctx_fp["0/META/COL/id"]) // 2, len(self.gctx_fp["0/META/COL/id"])), data_limit)
         data_idx.sort()
         data_idx = np.array(data_idx)
 
-        print("Collecting Matrix Data")
-        data_matrix = np.array(self.gctx_fp["0/DATA/0/matrix"][data_idx, :])
-        print("Matrix Data Collected")
-
-        self.gene_symbols = [s.decode("utf-8") for s in self.gctx_fp["/0/META/ROW/pr_gene_symbol"]]
-        self.important_genes = pd.read_csv("Data/important_genes.csv", header=None)[0].to_list()
-        self.gene_idx = np.array([self.gene_symbols.index(gene) for gene in self.important_genes])
+        data_list = []
+        for data_start in range(0, data_limit, 1000):
+            print(f"Processing Data Point {data_start}")
+            data_end = data_start + min(1000, data_limit - data_start)
+            data_idx_window = data_idx[data_start:data_end]
+            data_matrix = np.array(self.gctx_fp["0/DATA/0/matrix"][data_idx_window, :])[:, self.gene_idx]
+            data_list.append(data_matrix)
+        data_matrix = np.concatenate(data_list)
+        print(data_matrix.shape)
+        print(data_matrix)
 
         data_list = []
         for idx in range(len(data_matrix)):
-            data_list.append(get_zscore_minmax(data_matrix[idx, self.gene_idx]))
+            data_list.append(get_zscore_minmax(data_matrix[idx, :]))
         
         self.data_arr = np.array(data_list)
         print(self.data_arr)

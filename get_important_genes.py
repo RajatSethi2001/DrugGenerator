@@ -27,7 +27,16 @@ class AllGenePertDataset(Dataset):
         self.pert_id = [s.decode('utf-8') for s in self.gctx_fp["0/META/COL/pert_id"][data_idx]]
         self.gene_symbols = np.array([s.decode("utf-8") for s in self.gctx_fp["/0/META/ROW/pr_gene_symbol"]])
 
-        print("Data Collected")
+        data_list = []
+        for data_start in range(0, data_limit, 1000):
+            print(f"Processing Data Point {data_start}")
+            data_end = data_start + min(1000, data_limit - data_start)
+            data_idx_window = data_idx[data_start:data_end]
+            data_matrix = np.array(self.gctx_fp["0/DATA/0/matrix"][data_idx_window, :])
+            data_list.append(data_matrix)
+        data_matrix = np.concatenate(data_list)
+        print(data_matrix.shape)
+        print(data_matrix)
 
         compound_df = pd.read_csv(compound_file, sep="\t")
         self.smiles_lookup = compound_df.set_index("pert_id")["canonical_smiles"].to_dict()
@@ -37,7 +46,7 @@ class AllGenePertDataset(Dataset):
             self.selfies_alphabet = f.read().splitlines()
 
         data_map = {}
-        for idx in data_idx:
+        for idx in range(len(data_matrix)):
             id_parts = self.ids[idx].split(":")
         
             if len(id_parts) < 2:
@@ -74,26 +83,15 @@ class AllGenePertDataset(Dataset):
             else:
                 print(f"Condition {condition} has no valid mappings")
         
-        enc_hidden_size = 1024
-        enc_layers = 2
-        enc_activation = nn.GELU
-
-        dec_hidden_size = 1024
-        dec_layers = 2
-        dec_activation = nn.GELU
-
+        hidden_size = 1024
         self.encoder = SelfiesEncoder(len(self.selfies_alphabet),
                             max_selfies_len=max_selfies_len,
-                            hidden_size=enc_hidden_size,
-                            num_layers=enc_layers,
-                            activation_fn=enc_activation)
+                            hidden_size=hidden_size)
     
         self.decoder = SelfiesDecoder(len(self.selfies_alphabet),
                                 max_selfies_len=max_selfies_len,
-                                embedding_size=dec_hidden_size,
-                                hidden_size=dec_hidden_size,
-                                num_layers=dec_layers,
-                                activation_fn=dec_activation)
+                                embedding_size=hidden_size,
+                                hidden_size=hidden_size)
 
         ae_checkpoint = torch.load("Models/selfies_autoencoder.pth")
         self.encoder.load_state_dict(ae_checkpoint["encoder_model"])
@@ -107,7 +105,7 @@ class AllGenePertDataset(Dataset):
         for condition_id, gene_data in data_map_items:
             ctl_exprs = []
             for ctl_idx in gene_data["ctl_idx"]:
-                ctl_expr_total = np.array(self.gctx_fp["0/DATA/0/matrix"][ctl_idx, :])
+                ctl_expr_total = np.array(data_matrix[ctl_idx, :])
                 ctl_expr = get_zscore_minmax(ctl_expr_total)
                 ctl_exprs.append(ctl_expr)
             
@@ -124,7 +122,7 @@ class AllGenePertDataset(Dataset):
 
             for trt_idx in gene_data["trt_idx"]:
                 try:
-                    trt_expr_total = np.array(self.gctx_fp["0/DATA/0/matrix"][trt_idx, :])
+                    trt_expr_total = np.array(data_matrix[trt_idx, :])
                     trt_expr = torch.tensor(get_zscore_minmax(trt_expr_total), dtype=torch.float32)
                     smiles = self.smiles_lookup[self.pert_id[trt_idx]]
                     smiles_embedding = torch.tensor(smiles_to_embedding(smiles, self.selfies_alphabet, self.encoder), dtype=torch.float32)
@@ -185,8 +183,7 @@ def main():
         salmon_gene_data.pop(0)
         ensembl_ids = {gene_expr.split(".")[0] for gene_expr in salmon_gene_data}
 
-    epochs = 100
-
+    epochs = 10
     for epoch in range(epochs):
         print(f"Training Epoch {epoch}")
         model.train()
@@ -227,43 +224,43 @@ def main():
             total_trt_expr = torch.cat([total_trt_expr, trt_expr])
 
             batch += 1
-        per_gene_r = np.array([criterion(total_pred_expr[:,g], total_trt_expr[:,g]).item() for g in range(len(dataset.get_gene_symbols()))])
-        top_genes_idx = np.argsort(per_gene_r)
-        top_genes = dataset.get_gene_symbols()[top_genes_idx]
-        top_genes_loss = per_gene_r[top_genes_idx]
-
-        with open("Data/important_genes.csv", "w") as f:
-            for idx in range(len(top_genes)):
-                symbol = top_genes[idx]
-                gene_loss = top_genes_loss[idx]
-                print(f"{symbol}, {gene_loss}")
-                if gene_loss > 0.13:
-                    break
-                result = mg.query(symbol, scopes="symbol", fields="ensembl.gene", species="human")
-
-                # Extract Ensembl IDs
-                if result and 'hits' in result and result['hits']:
-                    hit = result["hits"][0]
-                    if 'ensembl' in hit:
-                        # Handle cases where ensembl might be a list or single dict
-                        ensembl_data = hit['ensembl']
-                        if isinstance(ensembl_data, list):
-                            # Take the first one if multiple
-                            ensembl_id = ensembl_data[0].get('gene')
-                        else:
-                            ensembl_id = ensembl_data.get('gene')
-                    else:
-                        ensembl_id = None
-                    
-                    if ensembl_id is not None and ensembl_id in ensembl_ids:
-                        f.write(f"{symbol},{ensembl_id}\n")
-
-            # input()
-
-            # print(f"Test Batch {batch}: Loss = {loss.item()}")
-
+        
         test_loss /= batch   
         print(f"Testing Loss = {test_loss}, Pearson-R = {pearsonr(pred_expr.detach().numpy()[0], trt_expr.detach().numpy()[0])[0]}")
+        
+    per_gene_r = np.array([criterion(total_pred_expr[:,g], total_trt_expr[:,g]).item() for g in range(len(dataset.get_gene_symbols()))])
+    top_genes_idx = np.argsort(per_gene_r)
+    top_genes = dataset.get_gene_symbols()[top_genes_idx]
+    top_genes_loss = per_gene_r[top_genes_idx]
+
+    with open("Data/important_genes.csv", "w") as f:
+        genes_added = 0
+        for idx in range(len(top_genes)):
+            if genes_added >= 2048:
+                break
+
+            symbol = top_genes[idx]
+            gene_loss = top_genes_loss[idx]
+            print(f"{symbol}, {gene_loss}")
+            result = mg.query(symbol, scopes="symbol", fields="ensembl.gene", species="human")
+
+            # Extract Ensembl IDs
+            if result and 'hits' in result and result['hits']:
+                hit = result["hits"][0]
+                if 'ensembl' in hit:
+                    # Handle cases where ensembl might be a list or single dict
+                    ensembl_data = hit['ensembl']
+                    if isinstance(ensembl_data, list):
+                        # Take the first one if multiple
+                        ensembl_id = ensembl_data[0].get('gene')
+                    else:
+                        ensembl_id = ensembl_data.get('gene')
+                else:
+                    ensembl_id = None
+                
+                if ensembl_id is not None and ensembl_id in ensembl_ids:
+                    f.write(f"{symbol},{ensembl_id}\n")
+                    genes_added += 1
 
 if __name__=="__main__":
     main()

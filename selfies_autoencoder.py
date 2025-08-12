@@ -94,11 +94,11 @@ def main():
     batch_size = 128
     input_noise = 0.02
 
-    hidden_size = 512
-    lr = 1e-5
+    hidden_size = 1024
+    lr = 1e-4
     weight_decay = 1e-3
 
-    compound_df = pd.read_csv(compound_file, sep="\t", nrows=50000)
+    compound_df = pd.read_csv(compound_file, sep="\t", nrows=80000)
     smiles_list = compound_df["canonical_smiles"].to_list()
 
     with open("Data/selfies_alphabet.txt", "r") as f:
