@@ -15,8 +15,9 @@ from train_gctx import GenePertModel
 from utils import clean_dose_unit, get_zscores, get_minmax, get_zscore_minmax, set_seeds, smiles_to_embedding
 
 class AllGenePertDataset(Dataset):
-    def __init__(self, gctx_file, compound_file, data_limit=20000, max_selfies_len=50):
+    def __init__(self, gctx_file, compound_file, data_limit=30000, max_selfies_len=50):
         self.gctx_fp = h5py.File(gctx_file, "r")
+        gene_limit = 2048
         
         data_idx = random.sample(range(0, len(self.gctx_fp["0/META/COL/id"])), data_limit)
         data_idx.sort()
@@ -25,14 +26,16 @@ class AllGenePertDataset(Dataset):
         self.ids = [s.decode('utf-8') for s in self.gctx_fp["0/META/COL/id"][data_idx]]
         self.pert_types = [s.decode('utf-8') for s in self.gctx_fp["0/META/COL/pert_type"][data_idx]]
         self.pert_id = [s.decode('utf-8') for s in self.gctx_fp["0/META/COL/pert_id"][data_idx]]
-        self.gene_symbols = np.array([s.decode("utf-8") for s in self.gctx_fp["/0/META/ROW/pr_gene_symbol"]])
+        self.gene_symbols = np.array([s.decode("utf-8") for s in self.gctx_fp["/0/META/ROW/pr_gene_symbol"][:gene_limit]])
+
+        print("Metadata Collected")
 
         data_list = []
         for data_start in range(0, data_limit, 1000):
             print(f"Processing Data Point {data_start}")
             data_end = data_start + min(1000, data_limit - data_start)
             data_idx_window = data_idx[data_start:data_end]
-            data_matrix = np.array(self.gctx_fp["0/DATA/0/matrix"][data_idx_window, :])
+            data_matrix = np.array(self.gctx_fp["0/DATA/0/matrix"][data_idx_window, :gene_limit])
             data_list.append(data_matrix)
         data_matrix = np.concatenate(data_list)
         print(data_matrix.shape)
@@ -117,22 +120,23 @@ class AllGenePertDataset(Dataset):
             
             if np.isnan(ctl_expr_median).any():
                 continue
-                
-            ctl_expr_median = torch.tensor(ctl_expr_median, dtype=torch.float32)
-
-            for trt_idx in gene_data["trt_idx"]:
-                try:
-                    trt_expr_total = np.array(data_matrix[trt_idx, :])
-                    trt_expr = torch.tensor(get_zscore_minmax(trt_expr_total), dtype=torch.float32)
-                    smiles = self.smiles_lookup[self.pert_id[trt_idx]]
-                    smiles_embedding = torch.tensor(smiles_to_embedding(smiles, self.selfies_alphabet, self.encoder), dtype=torch.float32)
-
-                    self.gctx_data.append((ctl_expr_median, trt_expr, smiles_embedding))
-                except Exception as e:
-                    print(f"Error processing treatment {trt_idx}: {e}")
-                    continue
             
-            print(f"Conditions Processed: {len(self.gctx_data)}")
+            with torch.no_grad():
+                ctl_expr_median = torch.tensor(ctl_expr_median, dtype=torch.float32)
+
+                for trt_idx in gene_data["trt_idx"]:
+                    try:
+                        trt_expr_total = np.array(data_matrix[trt_idx, :])
+                        trt_expr = torch.tensor(get_zscore_minmax(trt_expr_total), dtype=torch.float32)
+                        smiles = self.smiles_lookup[self.pert_id[trt_idx]]
+                        smiles_embedding = torch.tensor(smiles_to_embedding(smiles, self.selfies_alphabet, self.encoder), dtype=torch.float32)
+
+                        self.gctx_data.append((ctl_expr_median, trt_expr, smiles_embedding))
+                    except Exception as e:
+                        print(f"Error processing treatment {trt_idx}: {e}")
+                        continue
+                
+                print(f"Conditions Processed: {len(self.gctx_data)}")
         
         del self.ids
         del self.pert_types
@@ -152,9 +156,14 @@ class AllGenePertDataset(Dataset):
         return self.gene_symbols
 
 def main():
-    set_seeds(1111)
+    set_seeds(111)
 
     train_test_split = 0.2
+    num_genes_to_collect = 256
+    epochs = 35
+    hidden_size = 1024
+    selfies_embedding_size = 1024
+
     dataset = AllGenePertDataset("Data/annotated_GSE92742_Broad_LINCS_Level5_COMPZ_n473647x12328.gctx", "Data/compoundinfo_beta.txt")
     mg = mygene.MyGeneInfo()
 
@@ -167,15 +176,15 @@ def main():
     train_dataset = Subset(dataset, train_indices)
     test_dataset = Subset(dataset, test_indices)
 
-    batch_size = 128
+    batch_size = 64
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
 
     criterion = nn.L1Loss()
-    training_noise = 0.02
+    training_noise = 0.0
 
-    model = GenePertModel(len(dataset.get_gene_symbols()), 1024, 1600, dropout_prob=0.0, activation_fn=nn.GELU)
-    optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-3, betas=(0.9, 0.999))
+    model = GenePertModel(len(dataset.get_gene_symbols()), selfies_embedding_size, hidden_size, dropout_prob=0.0, activation_fn=nn.GELU)
+    optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
 
     sample_salmon_file = "Conditions/Healthy/SRR16316900.csv"
     with open(sample_salmon_file, "r") as f:
@@ -183,7 +192,6 @@ def main():
         salmon_gene_data.pop(0)
         ensembl_ids = {gene_expr.split(".")[0] for gene_expr in salmon_gene_data}
 
-    epochs = 10
     for epoch in range(epochs):
         print(f"Training Epoch {epoch}")
         model.train()
@@ -228,15 +236,18 @@ def main():
         test_loss /= batch   
         print(f"Testing Loss = {test_loss}, Pearson-R = {pearsonr(pred_expr.detach().numpy()[0], trt_expr.detach().numpy()[0])[0]}")
         
-    per_gene_r = np.array([criterion(total_pred_expr[:,g], total_trt_expr[:,g]).item() for g in range(len(dataset.get_gene_symbols()))])
-    top_genes_idx = np.argsort(per_gene_r)
+    
+    total_pred_expr = total_pred_expr.detach()
+    total_trt_expr = total_trt_expr.detach()
+    per_gene_r = np.array([pearsonr(total_pred_expr[:,g], total_trt_expr[:,g])[0] for g in range(len(dataset.get_gene_symbols()))])
+    top_genes_idx = np.argsort(per_gene_r)[::-1]
     top_genes = dataset.get_gene_symbols()[top_genes_idx]
     top_genes_loss = per_gene_r[top_genes_idx]
 
     with open("Data/important_genes.csv", "w") as f:
         genes_added = 0
         for idx in range(len(top_genes)):
-            if genes_added >= 2048:
+            if genes_added >= num_genes_to_collect:
                 break
 
             symbol = top_genes[idx]

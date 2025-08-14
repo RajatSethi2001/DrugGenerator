@@ -13,7 +13,7 @@ from torch.utils.data import Dataset, DataLoader, Subset
 from utils import set_seeds, get_zscore_minmax
 
 class GeneExprEncoder(nn.Module):
-    def __init__(self, num_genes, hidden_size=512, dropout_prob=0.2):
+    def __init__(self, num_genes, hidden_size=1024, dropout_prob=0.2):
         super().__init__()
         self.input_layer = nn.Linear(num_genes, hidden_size)
 
@@ -24,7 +24,7 @@ class GeneExprEncoder(nn.Module):
         
         self.output_layer = nn.Linear(hidden_size, hidden_size)
         self.sigmoid = nn.Sigmoid()
-        self.activation = nn.GELU()
+        self.activation = nn.ReLU()
         self.dropout = nn.Dropout(dropout_prob)
 
     def forward(self, gene_expr):
@@ -35,7 +35,7 @@ class GeneExprEncoder(nn.Module):
         return output
     
 class GeneExprDecoder(nn.Module):
-    def __init__(self, num_genes, embedding_size=512, hidden_size=512, dropout_prob=0.2):
+    def __init__(self, num_genes, embedding_size=1024, hidden_size=1024, dropout_prob=0.2):
         super().__init__()
         
         self.input_layer = nn.Linear(embedding_size, hidden_size)
@@ -46,7 +46,7 @@ class GeneExprDecoder(nn.Module):
         
         self.output_layer = nn.Linear(hidden_size, num_genes)
         self.sigmoid = nn.Sigmoid()
-        self.activation = nn.GELU()
+        self.activation = nn.ReLU()
         self.dropout = nn.Dropout(dropout_prob)
 
     def forward(self, embedding):
@@ -85,6 +85,7 @@ class GeneExprDataset(Dataset):
         
         self.data_arr = np.array(data_list)
         print(self.data_arr)
+        print(self.data_arr.shape)
 
         self.gctx_fp.close()
 
@@ -103,12 +104,13 @@ def main():
     save_dir = "Models"
     gctx_file = "Data/annotated_GSE92742_Broad_LINCS_Level5_COMPZ_n473647x12328.gctx"
 
-    batch_size = 128
-    input_noise = 0.01
+    batch_size = 64
+    input_noise = 0.0
 
-    hidden_size = 512
-    lr = 1e-4
-    weight_decay = 1e-3
+    hidden_size = 256
+    lr = 3e-4
+    weight_decay = 0.0
+    dropout_prob = 0.0
     
     dataset = GeneExprDataset(gctx_file)
     train_size = int(len(dataset) * (1 - train_test_split))
@@ -124,13 +126,15 @@ def main():
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
 
-    criterion = nn.MSELoss()
+    criterion = nn.L1Loss()
     encoder = GeneExprEncoder(len(dataset.get_gene_symbols()),
-                              hidden_size=hidden_size)
+                              hidden_size=hidden_size,
+                              dropout_prob=dropout_prob)
     
     decoder = GeneExprDecoder(len(dataset.get_gene_symbols()),
                               embedding_size=hidden_size,
-                              hidden_size=hidden_size)
+                              hidden_size=hidden_size,
+                              dropout_prob=dropout_prob)
 
     encoder_optim = optim.AdamW(encoder.parameters(), lr=lr, weight_decay=weight_decay)
     decoder_optim = optim.AdamW(decoder.parameters(), lr=lr, weight_decay=weight_decay)

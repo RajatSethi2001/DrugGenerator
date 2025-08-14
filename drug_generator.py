@@ -11,6 +11,7 @@ import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from gene_expr_autoencoder import GeneExprEncoder
 from gymnasium import spaces
 from rdkit import Chem
 from rdkit.Chem import QED
@@ -29,7 +30,7 @@ from scipy.stats import pearsonr
 def moving_average(data, window_size=50):
     return np.convolve(data, np.ones(window_size)/window_size, mode='valid')
 
-def process_gene_csv(path, desired_genes):
+def process_gene_csv(path, desired_genes, gene_encoder):
     df = pd.read_csv(path, index_col=0)
     df.index = [index.split(".")[0] for index in df.index]
     df = np.log2(df + 1)
@@ -37,8 +38,10 @@ def process_gene_csv(path, desired_genes):
     df = df.apply(get_zscore_minmax, axis=0)
     df = df.loc[desired_genes, :]
     df = df.transpose()
-    gene_expr = df.to_numpy().flatten()
-    return gene_expr
+    gene_expr = torch.tensor(df.to_numpy().flatten(), dtype=torch.float32).unsqueeze(0)
+    with torch.no_grad():
+        gene_encoding = gene_encoder(gene_expr)[0].detach().cpu().numpy()
+    return gene_encoding
 
 def sigmoid(x):
   return 1 / (1 + math.exp(-x))
@@ -367,27 +370,29 @@ class DrugGenEnv(gym.Env):
         self.genes = pd.read_csv("Data/important_genes.csv", header=None)[1].to_list()
 
         gctx_checkpoint = torch.load(gctx_savefile, weights_only=False)
-        self.gctx_model = GenePertModel(len(self.genes), 1200, 1200, dropout_prob=0.5)
+        self.gctx_model = GenePertModel(len(self.genes), 1024, 512, dropout_prob=0.0, activation_fn=nn.ReLU)
         self.gctx_model.load_state_dict(gctx_checkpoint["model_state_dict"])
         self.gctx_model.eval()
 
         ae_checkpoint = torch.load(autoencoder_savefile)
-        dec_hidden_size = 400
-        dec_layers = 3
-        dec_activation = nn.GELU
+        dec_hidden_size = 1024
         self.decoder = SelfiesDecoder(len(self.selfies_alphabet),
                                 max_selfies_len=max_selfies_len,
                                 embedding_size=dec_hidden_size,
-                                hidden_size=dec_hidden_size,
-                                num_layers=dec_layers,
-                                activation_fn=dec_activation)
+                                hidden_size=dec_hidden_size)
         self.decoder.load_state_dict(ae_checkpoint["decoder_model"])
         self.decoder.eval()
 
         health_checkpoint = torch.load(health_savefile)
-        self.health_model = HealthModel(len(self.genes), 32)
+        self.health_model = HealthModel(len(self.genes), 20)
         self.health_model.load_state_dict(health_checkpoint["model_state_dict"])
         self.health_model.eval()
+
+        gene_ae_savefile = "Models/gene_expr_autoencoder.pth"
+        gene_ae_checkpoint = torch.load(gene_ae_savefile, weights_only=False)
+        gene_ae = GeneExprEncoder(256, 256, 0.0)
+        gene_ae.load_state_dict(gene_ae_checkpoint["encoder_model"])
+        gene_ae.eval()
 
         self.max_selfies_len = max_selfies_len
         self.reward_list = []
@@ -407,17 +412,14 @@ class DrugGenEnv(gym.Env):
             for file in os.listdir(dir):
                 filename = f"{dir}/{file}"
                 print(f"Processing {filename}")
-                self.condition_expr[filename] = process_gene_csv(filename, self.genes)
+                self.condition_expr[filename] = process_gene_csv(filename, self.genes, gene_ae)
         
         self.observation_space = spaces.Box(low=0, high=1, shape=(len(self.genes),), dtype=np.float32)
-        self.action_space = spaces.Box(low=0, high=1, shape=(402,), dtype=np.float32)
+        self.action_space = spaces.Box(low=0, high=1, shape=(1024,), dtype=np.float32)
         self.max_rewards = {filename: 0 for filename in self.condition_expr.keys()}
 
     def step(self, action: np.ndarray):
-        selfies_embedding = action[:(len(action) - 2)]
-        dosage_conc = action[len(action) - 2] * 5
-        dosage_time = action[len(action) - 1] * 5
-
+        selfies_embedding = action
         smiles = embedding_to_smiles(selfies_embedding, self.selfies_alphabet, self.decoder)
         if not validate_molecule(smiles):
             return self.current_obs_expr, 0, True, False, {}
@@ -429,25 +431,19 @@ class DrugGenEnv(gym.Env):
         with torch.no_grad():
             current_obs_expr_tensor = torch.tensor(self.current_obs_expr, dtype=torch.float32).unsqueeze(0)
             selfies_embedding_tensor = torch.tensor(selfies_embedding, dtype=torch.float32).unsqueeze(0)
-            dosage_conc_tensor = torch.tensor(dosage_conc, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
-            dosage_time_tensor = torch.tensor(dosage_time, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
             
-            new_expr = self.gctx_model(current_obs_expr_tensor, selfies_embedding_tensor, dosage_conc_tensor, dosage_time_tensor)
+            new_expr = self.gctx_model(current_obs_expr_tensor, selfies_embedding_tensor)
 
         original_health = self.health_model(current_obs_expr_tensor)[0].item()
         new_health = self.health_model(new_expr)[0].item()
 
         healthiness = new_health - original_health
-        unnorm_dosage_conc = (np.e ** dosage_conc) - 1
-        unnorm_dosage_time = (np.e ** dosage_time) - 1
         reward = max(0, healthiness) * sigmoid(10 * (qed_score - 0.5)) * sigmoid(10 * (0.5 - sa_score / 10)) * sigmoid(10 * (0.4 - risk_score))
         self.reward_list.append(reward)
 
         if reward > self.max_rewards[self.current_obs_file]:
             print(f"File: {self.current_obs_file}")
             print(f"SMILES: {smiles}")
-            print(f"Dosage Concentration: {unnorm_dosage_conc} uM")
-            print(f"Dosage Time: {unnorm_dosage_time} h")
             print(f"Healthiness Improvement: {healthiness}")
             print(f"Drug QED Score: {qed_score}")
             print(f"Drug SA Score: {sa_score}")

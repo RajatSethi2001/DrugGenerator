@@ -8,7 +8,8 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from gene_expr_autoencoder import GeneExprEncoder, GeneExprDecoder
-from scipy.stats import pearsonr
+from scipy.stats import pearsonr, spearmanr
+from sklearn.metrics import r2_score
 from selfies_autoencoder import SelfiesEncoder, SelfiesDecoder
 from torch.utils.data import Dataset, DataLoader, Subset
 from utils import get_zscore_minmax, get_zscores, clean_dose_unit, smiles_to_embedding, set_seeds
@@ -59,7 +60,7 @@ class PearsonCorrLoss(nn.Module):
         return 1 - r.mean()
 
 class GenePertDataset(Dataset):
-    def __init__(self, gctx_file, compound_file, data_limit=80000, max_selfies_len=50, gene_ae_hidden_size=512, selfies_ae_hidden_size=512):
+    def __init__(self, gctx_file, compound_file, data_limit=60000, max_selfies_len=50, gene_ae_hidden_size=256, selfies_ae_hidden_size=1024):
         self.gctx_fp = h5py.File(gctx_file, "r")
         
         data_idx = random.sample(range(0, len(self.gctx_fp["0/META/COL/id"]) // 2), data_limit)
@@ -133,7 +134,8 @@ class GenePertDataset(Dataset):
                 print(f"Condition {condition} has no valid mappings")
 
         self.gene_expr_encoder = GeneExprEncoder(len(self.important_genes),
-                                                 hidden_size=gene_ae_hidden_size)
+                                                 hidden_size=gene_ae_hidden_size,
+                                                 dropout_prob=0.0)
 
         gene_expr_ae_checkpoint = torch.load("Models/gene_expr_autoencoder.pth")
         self.gene_expr_encoder.load_state_dict(gene_expr_ae_checkpoint["encoder_model"])
@@ -141,7 +143,8 @@ class GenePertDataset(Dataset):
 
         self.selfies_encoder = SelfiesEncoder(len(self.selfies_alphabet),
                                               max_selfies_len=max_selfies_len,
-                                              hidden_size=selfies_ae_hidden_size)
+                                              hidden_size=selfies_ae_hidden_size,
+                                              dropout_prob=0.0)
 
         selfies_ae_checkpoint = torch.load("Models/selfies_autoencoder.pth")
         self.selfies_encoder.load_state_dict(selfies_ae_checkpoint["encoder_model"])
@@ -222,35 +225,22 @@ class GenePertModel(nn.Module):
 
         self.activation = activation_fn()
         self.sigmoid = nn.Sigmoid()
+        self.tanh = nn.Tanh()
         self.dropout = nn.Dropout(dropout_prob)
-
-        self._init_weights()
-        
-    def _init_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_normal_(m.weight)
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
     
     def forward(self, ctl_expr, smiles_embedding):
         x = torch.cat((ctl_expr, smiles_embedding), dim=-1)
         x = self.input_layer(x)
-        residual = x
+        
         x = self.dropout(self.activation(self.bn1(self.fc1(x))))
-        x = x + residual
-
-        residual = x
         x = self.dropout(self.activation(self.bn2(self.fc2(x))))
-        x = x + residual
-
         x = self.dropout(self.activation(self.bn3(self.fc3(x))))
 
-        output = self.sigmoid(self.output_layer(x))
+        output = self.output_layer(x)
         return output
 
 def main():
-    set_seeds(3333)
+    set_seeds(333)
 
     train_test_split = 0.2
     dataset = GenePertDataset("Data/annotated_GSE92742_Broad_LINCS_Level5_COMPZ_n473647x12328.gctx", "Data/compoundinfo_beta.txt")
@@ -269,11 +259,11 @@ def main():
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
 
-    criterion = nn.MSELoss()
-    training_noise = 0.02
+    criterion = nn.L1Loss()
+    training_noise = 0.0
 
-    model = GenePertModel(512, 512, 512, dropout_prob=0.2, activation_fn=nn.GELU)
-    optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-3, betas=(0.9, 0.999))
+    model = GenePertModel(256, 1024, 512, dropout_prob=0.0, activation_fn=nn.ReLU)
+    optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-3)
 
     if os.path.exists(model_savefile):
         checkpoint = torch.load(model_savefile, weights_only=False)
@@ -312,6 +302,7 @@ def main():
         model.eval()
         test_loss = 0
         batch = 0
+        total_ctl_expr = torch.tensor([], dtype=torch.float32)
         total_pred_expr = torch.tensor([], dtype=torch.float32)
         total_trt_expr = torch.tensor([], dtype=torch.float32)
         for ctl_expr, trt_expr, smiles_embedding in test_loader:
@@ -321,28 +312,33 @@ def main():
 
             batch += 1
 
+            total_ctl_expr = torch.cat([total_ctl_expr, ctl_expr])
             total_pred_expr = torch.cat([total_pred_expr, pred_expr])
             total_trt_expr = torch.cat([total_trt_expr, trt_expr])
 
-            # pred_std = pred_expr.std(dim=1).mean().item()
-            # tgt_std  = trt_expr.std(dim=1).mean().item()
-            # print("pred_std:", pred_std, "tgt_std:", tgt_std)
-            
-            # r_list = []
-            # for i in range(pred_expr.shape[0]):
-            #     r_list.append(pearsonr(pred_expr[i].detach().numpy(), trt_expr[i].detach().numpy())[0])
-            # print(np.percentile(r_list,[5,25,50,75,95]), np.mean(r_list))
+        total_ctl_expr = total_ctl_expr.detach()
+        total_pred_expr = total_pred_expr.detach()
+        total_trt_expr = total_trt_expr.detach()
 
-            # per_gene_r = [pearsonr(pred_expr[:,g].detach().numpy(), trt_expr[:,g].detach().numpy())[0] for g in range(len(dataset.get_gene_symbols()))]
-            # print(np.percentile(per_gene_r,[5,25,50,75,95]), np.mean(per_gene_r))
+        pred_std = total_pred_expr.std(dim=1).mean().item()
+        tgt_std  = total_trt_expr.std(dim=1).mean().item()
+        print("pred_std:", pred_std, "tgt_std:", tgt_std)
 
-            # input()
+        print(f"Control Expr: {total_ctl_expr[0, :10]}")
+        print(f"Trt Expr: {total_trt_expr[0, :10]}")
+        print(f"Predict Expr: {total_pred_expr[0, :10]}")
 
-            # print(f"Test Batch {batch}: Loss = {loss.item()}")
+        print(f"Mean Control: {total_ctl_expr.mean()}")
+        print(f"Mean Treated: {total_trt_expr.mean()}")
+        print(f"Mean Predicted: {total_pred_expr.mean()}")
 
-        test_loss /= batch
+        print(f"Spearman: {spearmanr(total_trt_expr.flatten(), total_pred_expr.flatten())[0]}")
+        print(f"R2 Score: {r2_score(total_trt_expr.flatten(), total_pred_expr.flatten())}")
+
+        test_loss = criterion(total_pred_expr, total_trt_expr).item()
+        ctl_trt_loss = criterion(total_ctl_expr, total_trt_expr).item()
         pearson_corr_list = [pearsonr(total_pred_expr.detach().numpy()[idx], total_trt_expr.detach().numpy()[idx])[0] for idx in range(len(total_pred_expr))]
-        print(f"Testing Loss = {test_loss}, Pearson-R = {np.median(pearson_corr_list)}")
+        print(f"Testing Loss = {test_loss}, Ctl to Trt Loss = {ctl_trt_loss}, Pearson-R = {np.median(pearson_corr_list)}")
 
 if __name__=="__main__":
     main()

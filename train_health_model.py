@@ -7,26 +7,30 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
+from gene_expr_autoencoder import GeneExprEncoder
 from torch.utils.data import Dataset, DataLoader, Subset
 from utils import set_seeds, get_minmax, get_zscores, get_zscore_minmax
 
 class HealthDataset(Dataset):
-    def __init__(self, df: pd.DataFrame, genes):
-        self.df = df
+    def __init__(self, df: pd.DataFrame, genes, encoder):
+        self.gene_data = torch.tensor(df[genes].values, dtype=torch.float32)
+        with torch.no_grad():
+            self.gene_encodings = encoder(self.gene_data)
+        self.health_data = torch.tensor(df["Healthy"].values, dtype=torch.float32).unsqueeze(1)
+        print("Gene Encodings Shape = ", self.gene_encodings.shape)
+        print("Health Data Shape = ", self.health_data.shape)
         self.genes = genes
-    
+
     def __len__(self):
-        return len(self.df)
+        return len(self.gene_encodings)
 
     def __getitem__(self, idx):
-        gene_data = torch.tensor(self.df.iloc[idx, :][self.genes].values, dtype=torch.float32)
-        health_data = torch.tensor(self.df.iloc[idx, :]["Healthy"].flatten(), dtype=torch.float32)
-        return gene_data, health_data
+        return self.gene_encodings[idx, :], self.health_data[idx, :]
 
 class HealthModel(nn.Module):
-    def __init__(self, num_genes, hidden_neurons=32):
+    def __init__(self, gene_embedding_len, hidden_neurons=32):
         super().__init__()
-        self.input_layer = nn.Linear(num_genes, hidden_neurons)
+        self.input_layer = nn.Linear(gene_embedding_len, hidden_neurons)
         self.fc1 = nn.Linear(hidden_neurons, hidden_neurons)
         self.bn1 = nn.LayerNorm(hidden_neurons)
         self.fc2 = nn.Linear(hidden_neurons, hidden_neurons)
@@ -35,7 +39,7 @@ class HealthModel(nn.Module):
     
         self.activation = nn.ReLU()
         self.sigmoid = nn.Sigmoid()
-        self.dropout = nn.Dropout(0.1)
+        self.dropout = nn.Dropout(0.0)
     
     def forward(self, x):
         x = self.dropout(self.activation(self.input_layer(x)))
@@ -65,8 +69,15 @@ def main():
     unhealthy_dir = "Conditions/Unhealthy"
     savefile = "Models/health_model.pth"
     train_test_split = 0.2
-    batch_size = 8
+    batch_size = 16
     genes = pd.read_csv("Data/important_genes.csv", header=None)[1].to_list()
+
+    encoder_file = "Models/gene_expr_autoencoder.pth"
+    encoder_data = torch.load(encoder_file, weights_only=False)
+    encoder_state_dict = encoder_data["encoder_model"]
+    encoder = GeneExprEncoder(256, 256, 0.0)
+    encoder.load_state_dict(encoder_state_dict)
+    encoder.eval()
 
     total_df = pd.DataFrame()
     for filename in os.listdir(healthy_dir):
@@ -99,7 +110,7 @@ def main():
 
     print(total_df)
 
-    dataset = HealthDataset(total_df, genes)
+    dataset = HealthDataset(total_df, genes, encoder)
     train_size = int(len(dataset) * (1 - train_test_split))
     indices = list(range(len(dataset)))
     random.shuffle(indices)
@@ -113,14 +124,14 @@ def main():
     train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
     test_dataloader = DataLoader(test_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
 
-    model = HealthModel(len(genes))
-    optimizer = optim.AdamW(model.parameters(), lr=1e-5, weight_decay=1e-4)
+    model = HealthModel(len(genes), hidden_neurons=20)
+    optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
     if os.path.exists(savefile):
         checkpoint = torch.load(savefile, weights_only=True)
         model.load_state_dict(checkpoint["model_state_dict"])
 
-    criterion = nn.BCELoss()
-    for epoch in range(1000):
+    criterion = nn.L1Loss()
+    for epoch in range(501):
         print(f"Epoch: {epoch}")
         train_metrics = {"tp": np.float32(0), "tn": np.float32(0), "fp": np.float32(0), "fn": np.float32(0)}
         train_loss = 0
@@ -153,6 +164,7 @@ def main():
                     train_metrics["fn"] += 1
         
         if epoch % 20 == 0:
+            print(train_metrics)
             tp = train_metrics["tp"]
             tn = train_metrics["tn"]
             fp = train_metrics["fp"]
