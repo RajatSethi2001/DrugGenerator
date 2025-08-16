@@ -104,12 +104,13 @@ def main():
     save_dir = "Models"
     gctx_file = "Data/annotated_GSE92742_Broad_LINCS_Level5_COMPZ_n473647x12328.gctx"
 
-    batch_size = 64
+    batch_size = 128
     input_noise = 0.0
 
-    hidden_size = 256
-    lr = 3e-4
-    weight_decay = 0.0
+    hidden_size = 3600
+    lr = 1e-4
+    lr_limit = 1e-6
+    weight_decay = 1e-4
     dropout_prob = 0.0
     
     dataset = GeneExprDataset(gctx_file)
@@ -126,7 +127,7 @@ def main():
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
 
-    criterion = nn.L1Loss()
+    criterion = nn.MSELoss()
     encoder = GeneExprEncoder(len(dataset.get_gene_symbols()),
                               hidden_size=hidden_size,
                               dropout_prob=dropout_prob)
@@ -144,11 +145,11 @@ def main():
         encoder.load_state_dict(checkpoint["encoder_model"])
         decoder.load_state_dict(checkpoint["decoder_model"])
 
+    encoder_lr = lr
     encode_scheduler = ReduceLROnPlateau(encoder_optim, mode='min', factor=0.3, patience=3, threshold=1e-4)
     decode_scheduler = ReduceLROnPlateau(decoder_optim, mode='min', factor=0.3, patience=3, threshold=1e-4)
 
-    for epoch in range(250):
-        print(f"Epoch {epoch}")
+    while encoder_lr > lr_limit:
         encoder.train()
         decoder.train()
         train_loss = 0.0
@@ -178,6 +179,7 @@ def main():
         checkpoint = {
             "encoder_model": encoder.state_dict(),
             "decoder_model": decoder.state_dict(),
+            "embedding_dim": hidden_size
         }
         torch.save(checkpoint, f"{save_dir}/gene_expr_autoencoder.pth")
         

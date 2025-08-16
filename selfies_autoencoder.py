@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.optim.lr_scheduler import ReduceLROnPlateau, OneCycleLR, CosineAnnealingLR
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import Dataset, DataLoader, Subset
 from utils import one_hot_encode, one_hot_decode, set_seeds
 
@@ -89,16 +89,18 @@ def main():
     train_test_split = 0.2
     max_selfies_len = 50
     compound_file = "Data/chembl_35_chemreps.txt"
+    nrows = 80000
     save_dir = "Models"
 
     batch_size = 128
-    input_noise = 0.02
+    input_noise = 0.0
 
-    hidden_size = 1024
+    hidden_size = 800
     lr = 1e-4
     weight_decay = 1e-3
+    lr_limit = 1e-6
 
-    compound_df = pd.read_csv(compound_file, sep="\t", nrows=80000)
+    compound_df = pd.read_csv(compound_file, sep="\t", nrows=nrows)
     smiles_list = compound_df["canonical_smiles"].to_list()
 
     with open("Data/selfies_alphabet.txt", "r") as f:
@@ -135,12 +137,13 @@ def main():
         checkpoint = torch.load(f"{save_dir}/selfies_autoencoder.pth")
         encoder.load_state_dict(checkpoint["encoder_model"])
         decoder.load_state_dict(checkpoint["decoder_model"])
-
+    
+    encoder_lr = lr
+    decoder_lr = lr
     encode_scheduler = ReduceLROnPlateau(encoder_optim, mode='min', factor=0.3, patience=3, threshold=1e-3)
     decode_scheduler = ReduceLROnPlateau(decoder_optim, mode='min', factor=0.3, patience=3, threshold=1e-3)
 
-    for epoch in range(250):
-        print(f"Epoch {epoch}")
+    while encoder_lr > lr_limit:
         encoder.train()
         decoder.train()
         train_loss = 0.0
@@ -170,6 +173,7 @@ def main():
         checkpoint = {
             "encoder_model": encoder.state_dict(),
             "decoder_model": decoder.state_dict(),
+            "embedding_dim": hidden_size
         }
         torch.save(checkpoint, f"{save_dir}/selfies_autoencoder.pth")
         

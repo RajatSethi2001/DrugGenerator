@@ -10,14 +10,14 @@ import torch.nn as nn
 import torch.optim as optim
 from scipy.stats import pearsonr
 from selfies_autoencoder import SelfiesDecoder, SelfiesEncoder
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader, Dataset, Subset
 from train_gctx import GenePertModel
 from utils import clean_dose_unit, get_zscores, get_minmax, get_zscore_minmax, set_seeds, smiles_to_embedding
 
 class AllGenePertDataset(Dataset):
-    def __init__(self, gctx_file, compound_file, data_limit=30000, max_selfies_len=50):
+    def __init__(self, gctx_file, compound_file, selfies_ae_file, data_limit=30000, gene_limit=4096, max_selfies_len=50):
         self.gctx_fp = h5py.File(gctx_file, "r")
-        gene_limit = 2048
         
         data_idx = random.sample(range(0, len(self.gctx_fp["0/META/COL/id"])), data_limit)
         data_idx.sort()
@@ -86,17 +86,17 @@ class AllGenePertDataset(Dataset):
             else:
                 print(f"Condition {condition} has no valid mappings")
         
-        hidden_size = 1024
+        ae_checkpoint = torch.load(selfies_ae_file)
+        self.selfies_embedding_len = ae_checkpoint["embedding_dim"]
         self.encoder = SelfiesEncoder(len(self.selfies_alphabet),
                             max_selfies_len=max_selfies_len,
-                            hidden_size=hidden_size)
+                            hidden_size=self.selfies_embedding_len)
     
         self.decoder = SelfiesDecoder(len(self.selfies_alphabet),
                                 max_selfies_len=max_selfies_len,
-                                embedding_size=hidden_size,
-                                hidden_size=hidden_size)
+                                embedding_size=self.selfies_embedding_len,
+                                hidden_size=self.selfies_embedding_len)
 
-        ae_checkpoint = torch.load("Models/selfies_autoencoder.pth")
         self.encoder.load_state_dict(ae_checkpoint["encoder_model"])
         self.decoder.load_state_dict(ae_checkpoint["decoder_model"])
         self.encoder.eval()
@@ -154,17 +154,23 @@ class AllGenePertDataset(Dataset):
 
     def get_gene_symbols(self):
         return self.gene_symbols
+    
+    def get_selfies_embedding_len(self):
+        return self.selfies_embedding_len
 
 def main():
-    set_seeds(111)
+    set_seeds(1111)
 
     train_test_split = 0.2
-    num_genes_to_collect = 256
-    epochs = 35
-    hidden_size = 1024
-    selfies_embedding_size = 1024
+    num_genes_to_collect = 4000
+    data_limit = 20000
+    gene_limit = 12000
+    hidden_size = 4000
+    lr = 1e-3
+    lr_limit = 1e-6
+    weight_decay = 1e-4
 
-    dataset = AllGenePertDataset("Data/annotated_GSE92742_Broad_LINCS_Level5_COMPZ_n473647x12328.gctx", "Data/compoundinfo_beta.txt")
+    dataset = AllGenePertDataset("Data/annotated_GSE92742_Broad_LINCS_Level5_COMPZ_n473647x12328.gctx", "Data/compoundinfo_beta.txt", "Models/selfies_autoencoder.pth", data_limit=data_limit, gene_limit=gene_limit)
     mg = mygene.MyGeneInfo()
 
     train_size = int(len(dataset) * (1 - train_test_split))
@@ -180,11 +186,12 @@ def main():
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
 
-    criterion = nn.L1Loss()
+    criterion = nn.MSELoss()
     training_noise = 0.0
 
-    model = GenePertModel(len(dataset.get_gene_symbols()), selfies_embedding_size, hidden_size, dropout_prob=0.0, activation_fn=nn.GELU)
-    optimizer = optim.AdamW(model.parameters(), lr=1e-4, weight_decay=1e-4)
+    model = GenePertModel(len(dataset.get_gene_symbols()), dataset.get_selfies_embedding_len(), hidden_size, dropout_prob=0.0, activation_fn=nn.GELU)
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.3, patience=3, threshold=1e-3)
 
     sample_salmon_file = "Conditions/Healthy/SRR16316900.csv"
     with open(sample_salmon_file, "r") as f:
@@ -192,8 +199,8 @@ def main():
         salmon_gene_data.pop(0)
         ensembl_ids = {gene_expr.split(".")[0] for gene_expr in salmon_gene_data}
 
-    for epoch in range(epochs):
-        print(f"Training Epoch {epoch}")
+    current_lr = lr
+    while current_lr > lr_limit:
         model.train()
         train_loss = 0
         batch = 0
@@ -216,12 +223,12 @@ def main():
         train_loss /= batch
         print(f"Training Loss = {train_loss}")
 
-        print(f"Testing Epoch {epoch}")
         model.eval()
         test_loss = 0
         batch = 0
         total_pred_expr = torch.tensor([])
         total_trt_expr = torch.tensor([])
+        total_ctl_expr = torch.tensor([])
         for ctl_expr, trt_expr, smiles_embedding in test_loader:
             pred_delta_expr = model(ctl_expr, smiles_embedding)
             pred_expr = ctl_expr + pred_delta_expr
@@ -230,19 +237,25 @@ def main():
 
             total_pred_expr = torch.cat([total_pred_expr, pred_expr])
             total_trt_expr = torch.cat([total_trt_expr, trt_expr])
-
+            total_ctl_expr = torch.cat([total_ctl_expr, ctl_expr])
             batch += 1
         
         test_loss /= batch   
         print(f"Testing Loss = {test_loss}, Pearson-R = {pearsonr(pred_expr.detach().numpy()[0], trt_expr.detach().numpy()[0])[0]}")
-        
+        scheduler.step(test_loss)
+        current_lr = optimizer.param_groups[0]['lr']
+        print(f"Current LR = {current_lr}")
     
-    total_pred_expr = total_pred_expr.detach()
-    total_trt_expr = total_trt_expr.detach()
-    per_gene_r = np.array([pearsonr(total_pred_expr[:,g], total_trt_expr[:,g])[0] for g in range(len(dataset.get_gene_symbols()))])
-    top_genes_idx = np.argsort(per_gene_r)[::-1]
+    total_pred_expr = total_pred_expr.detach().cpu().numpy()
+    total_trt_expr = total_trt_expr.detach().cpu().numpy()
+    total_ctl_expr = total_ctl_expr.detach().cpu().numpy()
+    # per_gene_r = np.array([pearsonr(total_pred_expr[:,g], total_trt_expr[:,g])[0] for g in range(len(dataset.get_gene_symbols()))])
+    correct_signs = np.sign(total_trt_expr - total_ctl_expr)
+    pred_signs = np.sign(total_pred_expr - total_ctl_expr)
+    per_gene_sign_acc = np.mean(correct_signs == pred_signs, axis=0)
+    top_genes_idx = np.argsort(per_gene_sign_acc)[::-1]
     top_genes = dataset.get_gene_symbols()[top_genes_idx]
-    top_genes_loss = per_gene_r[top_genes_idx]
+    top_genes_metrics = per_gene_sign_acc[top_genes_idx]
 
     with open("Data/important_genes.csv", "w") as f:
         genes_added = 0
@@ -251,8 +264,8 @@ def main():
                 break
 
             symbol = top_genes[idx]
-            gene_loss = top_genes_loss[idx]
-            print(f"{symbol}, {gene_loss}")
+            gene_metric = top_genes_metrics[idx]
+            print(f"{symbol}, {gene_metric}")
             result = mg.query(symbol, scopes="symbol", fields="ensembl.gene", species="human")
 
             # Extract Ensembl IDs
@@ -270,7 +283,7 @@ def main():
                     ensembl_id = None
                 
                 if ensembl_id is not None and ensembl_id in ensembl_ids:
-                    f.write(f"{symbol},{ensembl_id}\n")
+                    f.write(f"{symbol},{ensembl_id},{gene_metric}\n")
                     genes_added += 1
 
 if __name__=="__main__":
